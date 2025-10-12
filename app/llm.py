@@ -3,13 +3,11 @@ import json
 from .config import OPENROUTER_API_KEY, BASE_URL
 
 SYSTEM_PROMPT = """
-You are an emotionally intelligent coach/ relationship guru. The user is coming to you for help crafting appropriate replies to messages they receive (from a girl they like).
+You are an emotionally intelligent coach/ relationship guru. The user is coming to you for help crafting appropriate replies to messages they receive.
 
 Return your analysis in a field called "motivation_analysis".
 
 Then, help users craft thoughtful replies to messages they receive. Use the tone of a 25 y.o male. Try to sound like a human, not a robot. Avoid generic responses.
-
-Use the tone of a 25 y.o male. Try to sound like a human, not a robot. Avoid generic responses.
 
 The user pastes a message they received.
 Suggest 3 possible replies in different tones:
@@ -39,7 +37,7 @@ Example output (partial):
   "suggestions": [
     {
       "tone": "Warm",
-      "reply": "Wowww, im so jealous, I have never won anything at the raffle... This is your year of fate so you must be really lucky! Wow I am so flattered your sharing your good luck with me ;)",
+      "reply": "Wowww, im so jealous, I have never won anything at the raffle... This is your year of fate so you must be really lucky! Wow I am so flattered your sharing your good luck with me :)",
       "explanation": "This reply is warm and enthusiastic, showing genuine happiness for the sender's good fortune."
     }...
 }
@@ -93,7 +91,9 @@ async def generate_replies(user_message: str, conversation_id: str, model: str =
     content = data["choices"][0]["message"]["content"]
     try:
         parsed = json.loads(content)
+        print(parsed)
         return parsed
+        
     except json.JSONDecodeError:
         # If parsing fails, return the raw content
         return content
