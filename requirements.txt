@@ -1,0 +1,10 @@
+# API + Frontend dependencies
+# Install with: pip install -r requirements.txt
+fastapi==0.117.1
+uvicorn==0.37.0
+httpx==0.28.1
+python-dotenv==1.1.1
+pydantic==2.11.9
+pydantic-settings==2.7.0
+requests==2.32.5
+streamlit==1.50.0

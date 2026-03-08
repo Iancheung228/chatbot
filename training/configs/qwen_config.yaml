@@ -1,0 +1,31 @@
+# Fine-tuning configuration for Qwen with Unsloth
+# Edit these values in VSCode, push to GitHub, then git pull in Colab before training
+
+model:
+  base_model: "unsloth/Qwen2.5-7B-Instruct-bnb-4bit"
+  max_seq_length: 2048
+  load_in_4bit: true
+
+training:
+  output_dir: "/content/drive/MyDrive/chatbot_model"  # Google Drive path
+  num_train_epochs: 3
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 2.0e-4
+  warmup_steps: 10
+  save_steps: 50
+  logging_steps: 10
+  fp16: true
+
+lora:
+  r: 16
+  lora_alpha: 16
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+data:
+  dataset_path: "data_pipeline/chat_dataset_wip"
+  train_split: 0.9
