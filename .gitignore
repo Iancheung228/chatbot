@@ -1,0 +1,44 @@
+# Python bytecode and cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+app/venv/
+env/
+
+# SQLite database
+*.db
+chatbot.db
+
+# Environment variables and secrets
+.env
+
+# Generated data files
+*.csv
+output.csv
+
+# Model weights (store in Google Drive, not git)
+*.pt
+*.bin
+*.safetensors
+*.gguf
+models/
+
+# macOS system files
+.DS_Store
+
+# VS Code settings
+.vscode/settings.json
+.idea/
+
+# Logs
+*.log
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
