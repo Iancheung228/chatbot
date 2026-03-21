@@ -1,3 +1,9 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+API_BASE = os.environ.get("API_BASE_URL", "http://localhost:8000")
+
 import streamlit as st
 import requests
 import uuid
@@ -18,7 +24,7 @@ if "clear_input" not in st.session_state:
 def fetch_history(conversation_id):
     try:
         response = requests.get(
-            "http://127.0.0.1:8000/get_history",
+            f"{API_BASE}/get_history",
             params={"conversation_id": conversation_id}
         )
         if response.status_code == 200:
@@ -73,8 +79,9 @@ st.text_area( #creates a text input box for you to type
 
 # --- Add two buttons instead of one ---
 col1, col2 = st.columns(2)
-send_as_friend = col1.button("Send as Friend 👤")
-send_as_user = col2.button("Send as User 💬")
+is_empty = not st.session_state.get("num_input_box", "").strip()
+send_as_friend = col1.button("Send as Friend 👤", disabled=is_empty)
+send_as_user = col2.button("Send as User 💬", disabled=is_empty)
 
 # Determine sender based on which button is clicked
 sender = None
@@ -85,7 +92,7 @@ elif send_as_user:
 
 # --- Only run if a button was clicked and message not empty ---
 if sender and st.session_state.num_input_box.strip():
-    from app.db import init_db, save_message
+    from api.db import init_db, save_message
 
 
     # 1️⃣ Save the message with correct sender
@@ -98,17 +105,21 @@ if sender and st.session_state.num_input_box.strip():
     if sender == "friend":
         try:
             response = requests.post(
-                "http://127.0.0.1:8000/suggest_reply",
+                f"{API_BASE}/suggest_reply",
                 json={
                     "message": st.session_state.num_input_box,
-                    "conversation_id": st.session_state["conversation_id"]
-                }
+                    "conversation_id": st.session_state["conversation_id"],
+                },
+                stream=True,
+                timeout=120,
             )
             if response.status_code == 200:
-                data = response.json()
-                st.write(data["motivation_analysis"])
-                st.success("Here’s a suggestion:")
-                st.write(data["suggestions"])
+                st.success("Suggested reply:")
+                st.write_stream(
+                    chunk for chunk in response.iter_content(
+                        chunk_size=None, decode_unicode=True
+                    ) if chunk
+                )
                 st.session_state["clear_input"] = True
                 st.session_state["input_box"] = ""
             else:
@@ -124,7 +135,7 @@ elif sender:  # If button clicked but no text
 # if st.button("Get Reply Suggestion"):
 #     if st.session_state.num_input_box.strip(): # only proceed if user_message is not empty
 #         # display friend's msg in chat UI immediately
-#         from app.db import init_db, save_message
+#         from api.db import init_db, save_message
 #         # Save the user message to the database
 #         save_message(st.session_state["conversation_id"], "friend", st.session_state.num_input_box)
 #         display_chat_ui(st.session_state["conversation_id"], chat_placeholder)
@@ -132,7 +143,7 @@ elif sender:  # If button clicked but no text
 #         # calls llm
 #         try:
 #             response = requests.post(
-#                 "http://127.0.0.1:8000/suggest_reply",
+#                 f"{API_BASE}/suggest_reply",
 #                 json={
 #                     "message": st.session_state.num_input_box,
 #                     "conversation_id": st.session_state["conversation_id"]

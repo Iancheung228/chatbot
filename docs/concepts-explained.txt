@@ -1,0 +1,655 @@
+CONCEPTS EXPLAINED — Text Coach Project
+========================================
+Written for: Ian (beginner to APIs and web architecture)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. CONFIG.PY AND .ENV — HOW THEY WORK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+.env — where your secrets and choices live
+-------------------------------------------
+.env is a flat text file of KEY=VALUE pairs. It is gitignored (never
+committed) because it holds real secrets (API keys) and environment-specific
+values like:
+
+    LLM_PROVIDER=openrouter
+    OPENROUTER_API_KEY=sk-abc123...
+    MODEL_NAME=openai/gpt-4o-mini
+    DB_PATH=chatbot.db
+
+The app does not read .env directly — it just sits on disk.
+
+api/config.py — the typed interface to those values
+-----------------------------------------------------
+Settings(BaseSettings) is a Python class powered by pydantic-settings.
+It does three things:
+
+1. Declares what variables exist and their defaults:
+       llm_provider: str = "openrouter"   # default if not set in .env
+       openrouter_api_key: str = ""       # default is empty string
+
+2. Auto-reads .env at startup (via class Config: env_file = ".env")
+   When settings = Settings() runs, pydantic-settings looks for
+   LLM_PROVIDER in the environment and maps it to llm_provider.
+   The mapping is automatic: env var OPENROUTER_API_KEY → field openrouter_api_key.
+
+3. Exposes a single settings object used everywhere:
+       from api.config import settings
+       provider = settings.llm_provider      # reads LLM_PROVIDER from .env
+       api_key = settings.openrouter_api_key # reads OPENROUTER_API_KEY from .env
+
+The mental model:
+   .env file          →    pydantic-settings     →    your code
+   LLM_PROVIDER=ollama     settings.llm_provider      if provider == "ollama":
+   OLLAMA_MODEL=qwen   →   settings.ollama_model   →      model = settings.ollama_model
+   DB_PATH=/data/db        settings.db_path            DB_PATH = settings.db_path
+
+Without config.py, every file would do os.environ.get("LLM_PROVIDER") —
+scattered, no defaults, no type safety, easy to typo. config.py centralizes
+all of that into one place.
+
+Why defaults matter:
+If a variable is not in .env, pydantic uses the default from the class.
+- llm_provider defaults to "openrouter" → app works without setting LLM_PROVIDER
+- vllm_base_url defaults to "" → vLLM is optional, won't crash if not set
+- db_path defaults to "chatbot.db" → SQLite file created locally in dev
+
+This means .env only needs to contain the values that differ from the
+defaults for your specific environment.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. WHAT IS A LOCAL HTTP API? HOW ABOUT OPENROUTER?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+What an API is
+--------------
+An API is a way for two programs to talk to each other over a network.
+HTTP API means they communicate using the same protocol your browser
+uses to load websites.
+
+The pattern is always:
+    your code  →  sends a request (input)  →  server
+    your code  ←  gets a response (output) ←  server
+
+For LLMs specifically, your code sends a message and gets a reply back.
+
+OpenRouter
+----------
+OpenRouter is a company that runs LLMs on their servers in the cloud.
+You don't own or control those servers.
+
+    your laptop
+        │
+        │  HTTP request over the internet
+        │  "here's a message, here's my API key"
+        ▼
+    OpenRouter's servers (somewhere in a data center)
+        │
+        │  runs GPT-4o-mini, charges your account per token
+        │
+        ▼
+    HTTP response back to your laptop
+        "here's the reply"
+
+Your API key is how OpenRouter knows who you are and what to bill.
+Without it, they reject the request.
+
+Local HTTP API (Ollama)
+-----------------------
+Ollama does the exact same thing — runs an LLM and accepts HTTP requests —
+but the server is YOUR OWN MACHINE, not a data center.
+
+    your code (api/llm.py)
+        │
+        │  HTTP request to localhost:11434
+        │  (never leaves your computer)
+        │
+        ▼
+    Ollama server (also running on your laptop)
+        │
+        │  runs your GGUF model on your CPU/GPU
+        │
+        ▼
+    HTTP response back to your code
+
+"localhost" means "this same machine". Port 11434 is just the door
+Ollama listens on. No internet, no API key, no billing.
+
+Why the same code works for both
+---------------------------------
+OpenRouter and Ollama both speak the OpenAI API format — the same
+request/response shape that OpenAI invented and everyone copied.
+So your api/llm.py code is identical for both, just pointing at
+a different URL:
+
+    # OpenRouter — cloud
+    base_url = "https://openrouter.ai/api/v1"
+    api_key  = "sk-or-..."          # required, they bill you
+
+    # Ollama — local
+    base_url = "http://localhost:11434/v1"
+    api_key  = "ollama"             # ignored, just needs to be non-empty
+
+    # vLLM on RunPod — your own cloud GPU
+    base_url = "https://your-pod.runpod.net/v1"
+    api_key  = "your-token"
+
+Same code, different URL. That's the whole point of the provider
+pattern — switching is just changing .env.
+
+Summary table:
+    ┌────────────┬─────────────────┬──────────────┬──────────────────┐
+    │            │ OpenRouter      │ Ollama       │ vLLM             │
+    ├────────────┼─────────────────┼──────────────┼──────────────────┤
+    │ Runs where │ Their cloud     │ Your laptop  │ Your rented GPU  │
+    │ Internet   │ Yes             │ No           │ Yes              │
+    │ Cost       │ Per token       │ Free         │ Per hour GPU     │
+    │ Model      │ GPT-4o-mini etc │ Your GGUF    │ Your fine-tuned  │
+    │ API format │ OpenAI-compat   │ OpenAI-compat│ OpenAI-compat    │
+    └────────────┴─────────────────┴──────────────┴──────────────────┘
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. HOW STREAMLIT WORKS — AND DOES IT HAVE AN API?
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Start with a restaurant analogy
+---------------------------------
+Imagine a restaurant:
+- You (the customer) sit at a table, look at a menu, talk to a waiter.
+- The waiter takes your order, goes to the kitchen, comes back with food.
+- The kitchen actually cooks the food. You never go in there.
+
+In your app:
+- You           = the user sitting at a browser
+- Streamlit     = the waiter (the thing you see and talk to)
+- FastAPI       = the kitchen (does the real work, you never see it)
+- The LLM       = a specialist chef the kitchen calls when needed
+
+What actually happens when you type a message
+---------------------------------------------
+
+Step 1 — You type in the browser
+    You open localhost:8501 in Chrome. You see a text box and a button.
+    That's Streamlit. It's just a webpage.
+
+Step 2 — You click "Send"
+    Your browser tells Streamlit: "the button was clicked."
+    Streamlit reruns frontend/app.py from top to bottom in Python.
+
+Step 3 — Streamlit calls FastAPI
+    Inside app.py there's this line:
+        response = requests.post("http://localhost:8000/suggest_reply",
+                                 json={"message": "..."})
+    This is Streamlit (the waiter) walking to the kitchen and placing
+    your order. It's just one program sending a message to another
+    program over HTTP.
+
+Step 4 — FastAPI receives the order
+    api/main.py is running separately on port 8000. It receives the
+    request, calls the LLM, waits for a reply.
+
+Step 5 — FastAPI returns the reply
+        return {"reply": "That sounds really hard, how are you feeling now?"}
+    It sends this back to Streamlit as JSON (structured text).
+
+Step 6 — Streamlit shows it to you
+        st.write(data["reply"])
+    The browser updates. You see the reply.
+
+What JSON is
+-------------
+JSON is a way to package data as text so two programs can share it.
+Like a standardized form:
+    {"reply": "That sounds really hard"}
+
+Streamlit sends JSON to FastAPI. FastAPI sends JSON back.
+They're just passing notes written in an agreed format.
+
+Does Streamlit have an API?
+-----------------------------
+No. Streamlit is a UI, not an API. It's the thing a human looks at
+and clicks on. It doesn't accept HTTP requests from other programs.
+
+In your project:
+    [User's browser]
+          │  clicks button / types message
+          ▼
+    [Streamlit  frontend/app.py :8501]   ← human-facing UI
+          │
+          │  HTTP request (requests.post)
+          ▼
+    [FastAPI  api/main.py :8000]         ← machine-facing API
+          │
+          │  calls generate_replies()
+          ▼
+    [LLM — OpenRouter / Ollama / vLLM]
+          │
+          │  returns reply text
+          ▼
+    [FastAPI]  returns {"reply": "..."}
+          │
+          ▼
+    [Streamlit]  displays it with st.write()
+
+Why split them at all?
+-----------------------
+You could put everything in one Streamlit script. But separating them:
+- FastAPI can be called by anything (mobile app, curl, another service)
+- Deploy independently (Streamlit on Streamlit Cloud, FastAPI on Railway)
+- FastAPI handles the database (Streamlit has no persistent state)
+- Swap the UI later (replace Streamlit with React, backend stays same)
+
+Streamlit is the face. FastAPI is the brain.
+They talk to each other over HTTP just like any two services would.
+
+The full picture in plain English:
+    YOUR BROWSER
+      "I typed a message and clicked Send"
+            ↓
+    STREAMLIT (frontend/app.py, port 8501)
+      "Got it. Let me ask the backend."
+      sends: { message: "I'm so tired today" }
+            ↓
+    FASTAPI (api/main.py, port 8000)
+      "Got it. Let me ask the LLM."
+            ↓
+    LLM (OpenRouter / Ollama)
+      "Here's a reply: 'Tell me what happened...'"
+            ↓
+    FASTAPI
+      "Got the reply. Sending it back."
+      sends: { reply: "Tell me what happened..." }
+            ↓
+    STREAMLIT
+      "Got the reply. Showing it on screen."
+            ↓
+    YOUR BROWSER
+      sees: "Tell me what happened..."
+
+Each arrow is just one program sending a message to another.
+That's all an API is — a defined way to send and receive those messages.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3b. CORS — WHY THE BROWSER BLOCKS CROSS-ORIGIN REQUESTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The problem CORS solves
+------------------------
+Browsers enforce a rule: a webpage at one "origin" (domain + port) is not
+allowed to make HTTP requests to a different origin unless that other
+server explicitly says it's OK.
+
+Origin = protocol + domain + port, e.g.:
+    https://yourapp.streamlit.app   ← frontend (Streamlit Cloud)
+    https://your-api.railway.app    ← backend  (Railway)
+
+These are different origins. When your Streamlit frontend runs in the
+browser and calls requests.post("https://your-api.railway.app/suggest_reply"),
+the browser intercepts it and first sends a "preflight" OPTIONS request:
+
+    Browser → Railway API:  "Can https://yourapp.streamlit.app talk to you?"
+    Railway API → Browser:  "Yes, all origins allowed."   (or it doesn't reply)
+    Browser → Railway API:  (now sends the real request)
+
+If the API doesn't send back the right headers, the browser silently
+blocks the request. Your app shows nothing, no clear error.
+
+Why it works locally but breaks in production
+----------------------------------------------
+Locally, both servers run on localhost (same origin). The browser doesn't
+apply the same-origin restriction to localhost→localhost. So you never see
+CORS errors during development — they only appear after deployment.
+
+The fix
+--------
+In api/main.py we add FastAPI's CORSMiddleware:
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],   # any origin is allowed
+        allow_methods=["*"],   # GET, POST, OPTIONS, etc.
+        allow_headers=["*"],   # any request headers
+    )
+
+This makes FastAPI respond to every preflight OPTIONS request with
+"yes, allowed" — the browser then proceeds with the real request.
+
+allow_origins=["*"] is fine for a personal project. For a public app
+you would tighten it to the specific frontend domain, e.g.:
+    allow_origins=["https://yourapp.streamlit.app"]
+
+Note: CORS is enforced by the BROWSER, not the server. If you call the
+API directly (curl, Postman, another server), CORS headers are ignored —
+they only matter for browser-based JavaScript/Streamlit requests.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3c. HEALTH ENDPOINTS — WHAT THEY ARE AND WHY PLATFORMS NEED THEM
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+What a health endpoint is
+--------------------------
+A health endpoint is a dedicated route (typically GET /health) that
+returns a simple 200 OK when the server is up and ready to handle requests.
+
+    GET /health  →  {"status": "ok"}   (HTTP 200)
+
+That's it. No auth, no logic, no DB query — just "I'm alive."
+
+Why deployment platforms need it
+----------------------------------
+Railway, Fly.io, Heroku, Kubernetes — all these platforms need to know
+whether your container is actually working, not just "running". A container
+can be running (process is alive) but broken (app crashed on startup,
+out of memory, misconfigured env var). They can't tell the difference
+without pinging an endpoint.
+
+The lifecycle on Railway:
+    1. Deploy → container starts
+    2. Railway pings GET /health every few seconds
+    3. If it gets 200 → deploy marked as successful, traffic routed to it
+    4. If it gets 500 or timeout → deploy marked as failed, rolled back
+
+Without /health, Railway falls back to checking if the process is alive
+(less reliable) or uses / which is also fine but /health is the
+well-known convention all platforms expect.
+
+Why Docker Compose needs it
+----------------------------
+In docker-compose.yml, you can say:
+
+    frontend:
+      depends_on:
+        api:
+          condition: service_healthy   ← wait until /health returns 200
+
+Without this condition, "depends_on: api" only means "start api container
+first" — not "wait until the API is actually ready to accept requests".
+The frontend container boots immediately, makes its first API call before
+uvicorn has finished starting up, and fails. The health check makes the
+frontend wait for real readiness.
+
+Locally you rarely notice this because both containers start fast.
+On a slow cloud VM or after a cold start it matters a lot.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3d. MODULE-LEVEL CACHING — LOADING RESOURCES ONCE AT STARTUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The problem
+------------
+The system prompt (training/prompts/system_v2.txt) needs to be included
+in every LLM request. The naive approach reads the file on every call:
+
+    def _load_system_prompt():
+        with open(settings.system_prompt_file) as f:
+            return f.read()                       # disk read every time
+
+This runs once per user message. The content never changes while the
+server is running, so every read after the first is wasted work.
+
+The pattern: module-level lazy cache
+--------------------------------------
+A better approach stores the result in a module-level variable and only
+reads the file the first time it's needed:
+
+    _SYSTEM_PROMPT: str = ""          # module-level variable, starts empty
+
+    def _get_system_prompt() -> str:
+        global _SYSTEM_PROMPT
+        if not _SYSTEM_PROMPT:        # only load on first call
+            with open(settings.system_prompt_file) as f:
+                _SYSTEM_PROMPT = f.read().strip()
+        return _SYSTEM_PROMPT         # all subsequent calls return the cached value
+
+First call  → file is read, stored in _SYSTEM_PROMPT, returned
+Second call → _SYSTEM_PROMPT already set, skip the file read, return it directly
+
+Why "module-level"?
+---------------------
+A module-level variable lives for the entire lifetime of the Python
+process. When uvicorn starts and imports api/llm.py, _SYSTEM_PROMPT is
+created as an empty string. It persists in memory until the server shuts
+down. Every request handler that calls _get_system_prompt() shares the
+same variable — so the file is read exactly once across all requests.
+
+This is different from a local variable inside a function, which is
+created and destroyed on every function call.
+
+The "global" keyword
+---------------------
+Inside a function, Python assumes any variable you assign to is a new
+local variable. "global _SYSTEM_PROMPT" tells Python: "when I write to
+_SYSTEM_PROMPT here, I mean the module-level one, not a new local one."
+Without it, the assignment inside the if-block would create a local
+variable that disappears when the function returns — the cache would
+never actually save anything.
+
+Failure timing benefit
+-----------------------
+If system_prompt_file is set to a wrong path in .env, the error now
+surfaces on the first request rather than at a random point later.
+Not quite "fail at startup", but much faster feedback than before.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3e. CONTEXT MANAGERS — "WITH" AND RESOURCE CLEANUP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The problem with manual cleanup
+---------------------------------
+When you open a resource (database connection, file, network socket),
+you must close it when you're done. The manual approach:
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT ...")           # what if this raises an exception?
+    conn.close()                      # this line is NEVER reached
+
+If c.execute() raises an exception (disk full, database locked, bad SQL),
+Python jumps out of the function immediately. conn.close() is skipped.
+The connection stays open, holding a lock on the database file.
+
+In a long-running server process, this leaks connections over time.
+SQLite has a limit on concurrent connections — eventually the server can
+no longer open new connections to the database.
+
+The "with" statement (context manager)
+----------------------------------------
+The with statement guarantees cleanup happens no matter what:
+
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT ...")       # exception here? doesn't matter
+    # conn.close() is called automatically here, success OR exception
+
+When Python exits the with block — whether normally or via an exception —
+it calls conn.__exit__(), which closes the connection. You don't write
+conn.close() at all; the with block handles it.
+
+How it works under the hood
+-----------------------------
+Any object that implements __enter__ and __exit__ methods can be used
+with "with". sqlite3.Connection does this:
+    __enter__: returns the connection object
+    __exit__:  commits the transaction (if no exception) and closes
+
+Files work the same way:
+    with open("file.txt") as f:
+        data = f.read()
+    # f.close() called automatically
+
+The mental model: "with" = "open this, use it, and guarantee it gets
+closed when I'm done, even if something goes wrong in the middle."
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3f. INPUT VALIDATION — FRONTEND VS BACKEND AND WHY YOU NEED BOTH
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The two layers of validation
+------------------------------
+When a user submits a form, there are two places you can check for
+bad input: in the frontend (before the request is sent) and in the
+backend (after it arrives). They serve different purposes.
+
+Frontend validation — UX guard
+--------------------------------
+Disabling the Send button when the text area is empty:
+
+    is_empty = not st.session_state.get("num_input_box", "").strip()
+    st.button("Send as Friend", disabled=is_empty)
+
+This is purely a UX improvement. When is_empty is True, Streamlit
+greys out the button and ignores clicks. The user gets instant
+feedback without any network round-trip.
+
+Why it's NOT enough on its own: frontend validation can be bypassed.
+Anyone can send a POST request directly to the API with curl or a script,
+skipping the Streamlit UI entirely. Frontend validation is for honest
+users with a normal browser — it doesn't protect your server.
+
+Backend validation — hard guard
+---------------------------------
+Pydantic's Field constraints in api/models.py:
+
+    class MessageRequest(BaseModel):
+        message: str = Field(min_length=1, max_length=4000)
+        conversation_id: str = Field(min_length=1, max_length=64)
+
+This runs before any route handler code executes. If the request body
+fails validation, FastAPI automatically returns:
+
+    HTTP 422 Unprocessable Entity
+    {"detail": [{"msg": "String should have at least 1 character", ...}]}
+
+No LLM call happens. No DB query happens. The bad request is rejected
+at the boundary before it can cause damage or waste money.
+
+Why it's NOT enough on its own: it gives no feedback until after the
+network round-trip. In a streaming setup (Ollama), you'd get no
+response for ~1s before seeing the error. Bad UX even if technically safe.
+
+The rule: defence in depth
+----------------------------
+Both layers together:
+    Frontend (disabled button)  →  prevents accidental sends, instant UX
+    Backend (Pydantic Field)    →  protects the server from all callers
+
+Frontend is for the user's convenience.
+Backend is for the system's correctness.
+Never rely on one without the other.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3g. DATABASE INDEXES — HOW SQLITE FINDS ROWS WITHOUT SCANNING EVERYTHING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+The problem: rows are stored in arrival order
+-----------------------------------------------
+A database table is like a notebook — rows are written in the order they
+arrive, not sorted by any column. When you query:
+
+    SELECT sender, content FROM messages WHERE conversation_id = 'abc'
+
+SQLite has to read EVERY row and check whether conversation_id matches.
+With 50,000 rows across many conversations, that's 50,000 comparisons
+to find the 20 rows you actually want.
+
+This is called a full table scan. It's fine with hundreds of rows,
+noticeably slow with millions.
+
+What an index is
+-----------------
+An index is a separate hidden data structure SQLite automatically
+maintains alongside the table. Think of it like the index at the back
+of a textbook — it maps values to page numbers:
+
+    INDEX on messages.conversation_id:
+        "abc-123"  →  rows [1, 3, 5, 11, 19, 204, ...]
+        "def-456"  →  rows [2, 4, 8, 14, 31, ...]
+        "xyz-789"  →  rows [6, 7, 9, ...]
+
+The index is kept sorted, so SQLite can binary-search it:
+- "Is abc-123 in the first half or second half?" → first half
+- "Is it in the first or second quarter?" → second quarter
+- ...finds it in ~17 comparisons instead of 50,000
+
+Once found, it gets the exact row locations and jumps straight to them.
+
+The trade-off
+--------------
+Every INSERT into messages also updates the index — SQLite must insert
+the new conversation_id into the sorted index structure. So writes get
+slightly slower. For a chat app where reads (every page load, every LLM
+call) vastly outnumber writes (one per message sent), this is always
+worth it.
+
+How we create it
+-----------------
+    CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id)
+
+- CREATE INDEX: build the lookup structure
+- IF NOT EXISTS: safe to run repeatedly — won't error if already there
+- idx_messages_conv: the index's name (used if you ever want to drop it)
+- ON messages (conversation_id): which table and column to index
+
+This runs inside init_db() so the index is created when the app starts.
+If the messages table already has rows (existing database), SQLite builds
+the index from existing data automatically — no data loss, no migration
+needed.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. GGUF, OLLAMA, AND THE LORA ADAPTER CHAIN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+What a LoRA adapter is
+-----------------------
+A LoRA adapter is NOT a complete model. It's a small set of weight
+changes (deltas) on top of the base model. It's ~50MB instead of ~3GB
+because it only stores what changed during training. You can't run it
+standalone — it needs the base model to attach to.
+
+Step 10b — Merge adapter into full model
+-----------------------------------------
+    base Qwen2.5-1.5B weights  +  your LoRA deltas  =  merged model
+         ~3GB on HF Hub              ~50MB                ~3GB (new repo)
+
+The merged model is what vLLM loads in production. It's a normal
+HuggingFace model — no special adapter loading needed.
+
+Step 10c — GGUF conversion for Ollama
+---------------------------------------
+GGUF is a file format designed for running LLMs locally on CPU/consumer
+GPU without a GPU cluster. It applies quantization (q4_k_m = 4-bit)
+which shrinks the merged model from ~3GB down to ~1GB and makes it fast
+enough to run on a MacBook.
+
+    merged model (HF format, fp16, ~3GB)  →  GGUF (4-bit quantized, ~1GB)
+
+What Ollama does
+-----------------
+Ollama is a local LLM server. You give it a GGUF file, it runs it as a
+local HTTP API on localhost:11434 — same OpenAI-compatible interface as
+OpenRouter or vLLM. Your api/llm.py calls it exactly like the others.
+
+The full chain:
+    Training (Colab)
+        ↓
+    LoRA adapter → HF Hub  (you have this ✓)
+        ↓
+    Step 10b: merge adapter into base model → HF Hub
+        ↓
+    Step 10c: convert merged model to GGUF → HF Hub
+        ↓
+    Download .gguf file locally → ollama/ folder
+        ↓
+    ollama create qwen-emotional-coach -f ollama/Modelfile
+        ↓
+    LLM_PROVIDER=ollama in .env → app talks to local Qwen

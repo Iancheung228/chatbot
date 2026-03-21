@@ -1,7 +1,10 @@
 import sqlite3
-from datetime import datetime
+import logging
+from api.config import settings
 
-DB_PATH = "chatbot.db"
+logger = logging.getLogger(__name__)
+
+DB_PATH = settings.db_path
 
 def init_db():
     # Use 'with' to connect to the SQLite database and automatically close the connection when done
@@ -28,8 +31,10 @@ def init_db():
         """
         c.execute(create_messages_table)
         c.execute(create_summaries_table)
+        c.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_summaries_conv ON summaries (conversation_id)")
         conn.commit()
-        print("Tables created successfully!")
+        logger.info("Database tables initialized")
 
 def save_message(conversation_id, sender, content):
     with sqlite3.connect(DB_PATH) as conn:
@@ -42,28 +47,24 @@ def save_message(conversation_id, sender, content):
         msg_data = (conversation_id, sender, content)
         c.execute(insert_to_msg_table, msg_data)
         conn.commit()
-        # No need to call connection.close(); it's done automatically!
-        print("Record inserted successfully!")
+        logger.debug("Message saved: conversation_id=%s sender=%s", conversation_id, sender)
 
 def get_last_messages(conversation_id, n=10):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT sender, content FROM messages WHERE conversation_id=? ORDER BY timestamp DESC LIMIT ?", (conversation_id, n))
-    messages = c.fetchall()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT sender, content FROM messages WHERE conversation_id=? ORDER BY timestamp DESC, id DESC LIMIT ?", (conversation_id, n))
+        messages = c.fetchall()
     return messages[::-1]  # reverse to chronological order
 
 def save_summary(conversation_id, summary):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO summaries (conversation_id, summary) VALUES (?, ?)", (conversation_id, summary))
-    conn.commit()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("INSERT INTO summaries (conversation_id, summary) VALUES (?, ?)", (conversation_id, summary))
+        conn.commit()
 
 def get_latest_summary(conversation_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT summary FROM summaries WHERE conversation_id=? ORDER BY timestamp DESC LIMIT 1", (conversation_id,))
-    row = c.fetchone()
-    conn.close()
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute("SELECT summary FROM summaries WHERE conversation_id=? ORDER BY timestamp DESC LIMIT 1", (conversation_id,))
+        row = c.fetchone()
     return row[0] if row else ""

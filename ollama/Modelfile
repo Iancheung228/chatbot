@@ -1,0 +1,25 @@
+# Modelfile for qwen-emotional-coach
+# Usage:
+#   ollama create qwen-emotional-coach -f ollama/Modelfile
+#
+# Before running, download the .gguf file from HuggingFace Hub:
+#   https://huggingface.co/YOUR_USERNAME/qwen-emotional-coach-v1-gguf
+# Place it in this folder as: qwen-emotional-coach-Q4_K_M.gguf
+
+FROM ./qwen2.5-1.5b-instruct.Q4_K_M.gguf
+
+# System prompt is sent at runtime by api/llm.py (reads from training/prompts/system_v2.txt)
+# Do not add SYSTEM here — it would conflict with the runtime prompt.
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ range .Messages }}<|im_start|>{{ .Role }}
+{{ .Content }}<|im_end|>
+{{ end }}<|im_start|>assistant
+"""
+
+PARAMETER stop "<|im_end|>"
+PARAMETER temperature 0.7
+PARAMETER top_p 0.9
+PARAMETER repeat_penalty 1.1
+PARAMETER num_ctx 2048

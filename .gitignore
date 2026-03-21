@@ -20,13 +20,20 @@ chatbot.db
 # Generated data files
 *.csv
 output.csv
+output/
 
-# Model weights (store in Google Drive, not git)
+# Image data archives and raw training data (store locally, not in git)
+*.zip
+convos_folder76/
+data_pipeline/chat_dataset_wip/
+
+# Model weights and LoRA outputs (store on HF Hub / Google Drive, not git)
 *.pt
 *.bin
 *.safetensors
 *.gguf
 models/
+lora_outputs/
 
 # macOS system files
 .DS_Store
@@ -34,6 +41,9 @@ models/
 # VS Code settings
 .vscode/settings.json
 .idea/
+
+# Test artifacts
+.pytest_cache/
 
 # Logs
 *.log

@@ -1,133 +1,112 @@
+"""
+OCR helpers for the data pipeline.
+Uses PaddleOCR with lazy singleton initialization.
+"""
+import os
+import json
+import hashlib
+from typing import List, Dict
+
 import cv2
 import numpy as np
-import pytesseract
 from paddleocr import PaddleOCR
-# from google.colab.patches import cv2_imshow
 
-'''
-takes in img path and parameters and extract the text from the image.
-returns message which is a list of tuples, the tuple contains (a,b,c)
-b is sender, c is trascribed text
-'''
-
-# for paddle
-ocr = PaddleOCR(lang='ch', use_angle_cls=True)  # 'ch' = Chinese; supports English+Chinese mix
-
-def screenshotsToText(img_path, scale=1.5):
-  # === 1. Load image ===
-  # img = cv2.imread("/content/Screenshot 2025-10-04 at 9.28.47 PM.png")
-  img = cv2.imread(img_path)
-  orig = img.copy()
-
-  img = cv2.resize(img, None, fx=scale, fy=scale)
-
-  # === 2. Preprocess and create masks ===
-  hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-  green_lower = np.array([35, 30, 60])
-  green_upper = np.array([90, 255, 255])
-
-  white_lower = np.array([0, 0, 240])
-  white_upper = np.array([180, 50, 255])
-
-  mask_green = cv2.inRange(hsv, green_lower, green_upper)
-  mask_white = cv2.inRange(hsv, white_lower, white_upper)
-  mask_all = cv2.bitwise_or(mask_green, mask_white)
-
-  ## 🔎 Debug 1: Show color masks
-  # print("green mask")
-  # cv2_imshow(mask_green)
-  # print("white mask")
-  # cv2_imshow(mask_white)
-  #cv2_imshow(mask_all)
-  #cv2.waitKey(0)
-
-  # === 3. Find contours (bubbles) ===
-  contours, _ = cv2.findContours(mask_all, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-  #print("Total contours found:", len(contours))
-
-  # debug_contours = orig.copy()
-  # cv2.drawContours(debug_contours, contours, -1, (0, 0, 255), 2)
-  # cv2_imshow(debug_contours)
-
-  messages = []
-  debug_img = img.copy()
-
-  for i, c in enumerate(contours):
-      x, y, w, h = cv2.boundingRect(c)
-
-      # Filter out noise
-      if w < 60 or h < 60:
-          continue
-
-      # Draw bounding boxes for debugging
-      cv2.rectangle(debug_img, (x, y), (x + w, y + h), (0, 0, 255), 2)
-      cv2.putText(debug_img, f"#{i}", (x, y - 5),
-                  cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
-
-      bubble = img[y:y+h, x:x+w]
-
-      # Sample mean color to classify sender
-      mean_color = cv2.mean(bubble)[:3]
-      hsv_mean = cv2.cvtColor(np.uint8([[mean_color]]), cv2.COLOR_BGR2HSV)[0][0]
-      sender = "You" if (green_lower[0] <= hsv_mean[0] <= green_upper[0]) else "Friend"
-
-      # OCR
-      # Convert to grayscale
-      gray = cv2.cvtColor(bubble, cv2.COLOR_BGR2GRAY)
-
-      # 1️⃣ Increase contrast (optional but helps a lot)
-      gray = cv2.convertScaleAbs(gray, alpha=1.5, beta=20)  # alpha=contrast, beta=brightness
-
-      # 2️⃣ Apply adaptive threshold (better for variable lighting)
-      thresh = cv2.adaptiveThreshold(
-          gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 3
-      )
-
-      # 3️⃣ (Optional) Invert if text is dark on light background
-      thresh = cv2.bitwise_not(thresh)
-
-      # 4️⃣ Slight dilation to connect broken strokes (good for Chinese)
-      kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4)) #(3,3) kernel → thicker by ~1 pixel in every direction
-      thresh = cv2.dilate(thresh, kernel, iterations=2)
-
-      #print(i)
-      #cv2_imshow(thresh)  # Debug: check what Tesseract will see
-
-      # OCR 
-      # 1) pytesseract
-      #text = pytesseract.image_to_string(thresh, lang="chi_sim", config="--psm 6").strip()
-
-###############################
-        #2) PaddleOCR
-        #PaddleOCR needs a 3-channel image.
-      if len(thresh.shape) == 2:  # If grayscale, convert to BGR
-        thresh = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-      result = ocr.ocr(thresh)
-      text = ""
-      if result and len(result[0]) > 0:
-          text = " ".join([line[1][0] for line in result[0]]).strip()
-      #print(text)
-###############################
+# Lazy singleton: { lang: PaddleOCR instance }
+_ocr_engines: Dict[str, PaddleOCR] = {}
 
 
+def get_ocr_engine(lang: str = "ch") -> PaddleOCR:
+    """Return a cached PaddleOCR instance for the given language."""
+    if lang not in _ocr_engines:
+        _ocr_engines[lang] = PaddleOCR(use_textline_orientation=True, lang=lang)
+    return _ocr_engines[lang]
 
-      if text:
-          messages.append((y, sender, text))
 
-      # 🔎 Debug 2: View each cropped bubble individually (optional)
-      #cv2_imshow(bubble)
-      # cv2.waitKey(0)
+# ---------- helpers ----------
 
-  # === 4. Show all detected bubbles ===
-  # cv2_imshow( debug_img)
-  # cv2.waitKey(0)
-  # cv2.destroyAllWindows()
+def crop_bubble_color(img: np.ndarray, poly: np.ndarray, pad: int = 8) -> np.ndarray:
+    h, w = img.shape[:2]
+    xs = [int(p[0]) for p in poly]
+    ys = [int(p[1]) for p in poly]
+    x_min, x_max = max(0, min(xs) - pad), min(w, max(xs) + pad)
+    y_min, y_max = max(0, min(ys) - pad), min(h, max(ys) + pad)
+    return img[y_min:y_max, x_min:x_max]
 
-  # === 5. Sort and print transcript ===
-  messages.sort(key=lambda m: m[0])
 
-  # print("\n🧠 Transcribed Conversation:\n")
-  # for _, sender, text in messages:
-  #     print(f"{sender}: {text}")
-  return messages
+def mean_hsv(crop: np.ndarray) -> np.ndarray:
+    if crop is None or crop.size == 0:
+        return np.array([0.0, 0.0, 0.0], dtype=float)
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    return hsv.mean(axis=(0, 1))
+
+
+def make_row_id(conversation_id, source_image, y_center, speaker) -> str:
+    raw = f"{conversation_id}|{source_image}|{round(y_center, 1)}|{speaker}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+# ---------- OCR parsing ----------
+
+def parse_paddle_result_dict(result_dict: dict) -> List[Dict]:
+    """Extract text entries from a single PaddleOCR result dict."""
+    entries = []
+
+    rec_texts = result_dict.get("rec_texts", [])
+    rec_scores = result_dict.get("rec_scores", [])
+    rec_polys = result_dict.get("rec_polys", result_dict.get("dt_polys", []))
+    output_img = result_dict.get("doc_preprocessor_res", {}).get("output_img", None)
+
+    for text, conf, poly in zip(rec_texts, rec_scores, rec_polys):
+        poly_arr = np.array(poly)
+        crop = crop_bubble_color(output_img, poly_arr) if output_img is not None else None
+        mean_h, mean_s, mean_v = mean_hsv(crop)
+        y_center = float(np.mean(poly_arr[:, 1]))
+
+        entries.append({
+            "text": text,
+            "conf": float(conf),
+            "y_center": y_center,
+            "mean_h": float(mean_h),
+            "mean_s": float(mean_s),
+            "mean_v": float(mean_v),
+        })
+
+    return entries
+
+
+# ---------- OCR with caching ----------
+
+def run_ocr_with_cache(img_path: str, cache_path: str, ocr: PaddleOCR) -> dict:
+    """Run OCR on an image, loading from cache if available."""
+    if os.path.exists(cache_path):
+        with open(cache_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    try:
+        results = ocr.predict(img_path)
+        if isinstance(results, dict):
+            results = [results]
+
+        entries = []
+        for r in results:
+            entries.extend(parse_paddle_result_dict(r))
+
+        cache = {
+            "source_image": os.path.basename(img_path),
+            "status": "ok" if entries else "empty",
+            "error": None,
+            "entries": entries,
+        }
+
+    except Exception as e:
+        cache = {
+            "source_image": os.path.basename(img_path),
+            "status": "error",
+            "error": str(e),
+            "entries": [],
+        }
+
+    with open(cache_path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+
+    return cache

@@ -1,44 +1,51 @@
-from fastapi import FastAPI
-from app.models import MessageRequest
-from app.llm import generate_replies
-from app.db import init_db  # <-- import your init_db function
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from api.models import MessageRequest
+from api.llm import generate_replies, stream_ollama_reply
+from api.db import init_db, get_last_messages
+from api.config import settings
 
 
-app = FastAPI(title="Text Coach API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()  # runs on startup
+    yield      # app is running
+               # anything after yield runs on shutdown
 
-@app.on_event("startup")
-def startup_event():
-    init_db()  # <-- create tables at app startup
+
+app = FastAPI(title="Text Coach API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
 def root():
     return {"message": "Text Coach API is running!"}
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 @app.post("/suggest_reply")
 async def suggest_reply(frd_msg: MessageRequest):
-
-    #### Instead of saving friend's msg here, we save it in frontend.py
-    from app.db import init_db, save_message
-    # # Save the user message to the database
-    # save_message(frd_msg.conversation_id, "friend", frd_msg.message)
-
-    # generate LLM reply
-    result = await generate_replies(frd_msg.message, frd_msg.conversation_id)
-
-    # Save only the first LLM suggestion to the database
-    suggestions = result.get("suggestions", [])
-    # I do not want to save bot's first reply automatically, i want the user to choose their prefered msg.
-    #if suggestions:
-    #    save_message(frd_msg.conversation_id, "bot", suggestions[0].get("reply", ""))
-
-    return {
-        "input": frd_msg.message,
-        "motivation_analysis": result.get("motivation_analysis"),
-        "suggestions": result.get("suggestions")
-    }
-
-from app.db import get_last_messages
+    try:
+        if settings.llm_provider == "ollama":
+            return StreamingResponse(
+                stream_ollama_reply(frd_msg.conversation_id),
+                media_type="text/plain",
+            )
+        # openrouter / vllm — non-streaming JSON
+        result = await generate_replies(frd_msg.conversation_id)
+        return {"reply": result.get("reply", "")}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
 
 @app.get("/get_history")
 def get_history(conversation_id: str):

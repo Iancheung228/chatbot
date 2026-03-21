@@ -1,0 +1,13 @@
+# Fine-tuning dependencies (GPU required — run on Google Colab or local GPU machine)
+# Install with: pip install -r requirements-training.txt
+# Note: unsloth must be installed before other packages on Colab
+unsloth
+datasets
+transformers
+accelerate
+peft
+trl
+bitsandbytes
+wandb
+huggingface_hub
+pyyaml
