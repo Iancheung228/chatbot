@@ -2,11 +2,16 @@
 # Usage:
 #   ollama create qwen-emotional-coach -f ollama/Modelfile
 #
-# Before running, download the .gguf file from HuggingFace Hub:
-#   https://huggingface.co/YOUR_USERNAME/qwen-emotional-coach-v1-gguf
-# Place it in this folder as: qwen-emotional-coach-Q4_K_M.gguf
+# Before running, download the fine-tuned GGUF from HuggingFace Hub:
+#   huggingface-cli download Iancheung2288/qwen2.5-1.5b-instruct-emotional-coach-gguf-q4km-v2 \
+#       --local-dir ollama/ \
+#       --filename "unsloth.Q4_K_M.gguf"
+#   mv ollama/unsloth.Q4_K_M.gguf ollama/qwen2.5-1.5b-instruct-emotional-coach-v2.Q4_K_M.gguf
+#
+# IMPORTANT: This must point to the FINE-TUNED model, not the base Qwen model.
+# The file below is produced by explore_v2.ipynb Step 10c (base + LoRA merged → GGUF).
 
-FROM ./qwen2.5-1.5b-instruct.Q4_K_M.gguf
+FROM ./qwen2.5-1.5b-instruct-emotional-coach-v2.Q4_K_M.gguf
 
 # System prompt is sent at runtime by api/llm.py (reads from training/prompts/system_v2.txt)
 # Do not add SYSTEM here — it would conflict with the runtime prompt.

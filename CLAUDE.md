@@ -7,7 +7,7 @@
 Three-layer architecture:
 1. **Serving layer** — FastAPI backend + Streamlit frontend
 2. **Data pipeline** — WeChat screenshot → PaddleOCR → CSV → JSONL fine-tuning data
-3. **Training** — Qwen2.5-1.5B fine-tuned with Unsloth on Google Colab GPU
+3. **Training** — Qwen2.5-1.5B fine-tuned with Unsloth on Google Colab GPU (notebook uploaded manually, not via git pull)
 
 ---
 
@@ -30,10 +30,10 @@ python -m data_pipeline.process \
   --out_json output/all_conversations.json \
   --out_jsonl output/unsloth_chatml.jsonl
 
-# 5. Fine-tuning (run on Google Colab GPU, not locally)
-#    In Colab: !git pull && !pip install -r requirements-training.txt -q
-python training/finetune.py --config training/configs/qwen_v1.yaml
-python training/finetune.py --config training/configs/qwen_v1.yaml --dry-run  # sanity check only
+# 5. Fine-tuning (upload explore_v2.ipynb to Google Colab manually — no git pull)
+#    - Upload training/explore_v2.ipynb to Colab
+#    - Upload all_conversations_cleaned.json to Google Drive root
+#    - Run cells top-to-bottom
 
 # 6. Docker (optional — use to test production behaviour locally)
 docker compose up --build
@@ -80,7 +80,6 @@ chatbot/
 ├── frontend/             Streamlit UI (run with streamlit run frontend/app.py)
 ├── data_pipeline/        Screenshot OCR → CSV/JSONL (runs locally or on Colab)
 ├── training/
-│   ├── finetune.py       Config-driven Unsloth SFT trainer
 │   ├── configs/          One YAML per experiment (qwen_v1.yaml = baseline)
 │   └── prompts/          System prompts as text files (git-tracked, version-controlled)
 ├── tests/                Pytest tests
@@ -104,7 +103,6 @@ chatbot/
 | `api/db.py` | SQLite conversation history (save_message, get_last_messages, get_latest_summary) |
 | `data_pipeline/ocr.py` | PaddleOCR helpers: `get_ocr_engine`, `run_ocr_with_cache`, `parse_paddle_result_dict` |
 | `data_pipeline/process.py` | Pipeline orchestration: `process_all_root`, `reconcile_rows`, `to_jsonl` |
-| `training/finetune.py` | Full training script — loads config YAML, trains, saves, optionally pushes to HF Hub |
 | `training/configs/qwen_v1.yaml` | Baseline experiment config — copy to start a new experiment |
 | `training/prompts/system_v1.txt` | Chinese system prompt for fine-tuning (edit here, not in code) |
 
@@ -164,13 +162,11 @@ One experiment = one YAML config file + one WandB run + one HF Hub model version
 
 ```
 1. Edit code or YAML in VSCode (with Claude Code's help)
-2. git push
-3. In Colab (GPU runtime):
-   !git pull
-   !pip install -r requirements-training.txt -q
-   Run explore_v2.ipynb top-to-bottom
-4. Adapter → HF Hub (HF_HUB_REPO)
-5. Merged model → HF Hub (HF_HUB_REPO + "-merged")  ← use this in production MODEL_NAME
+2. Upload training/explore_v2.ipynb to Google Colab manually
+3. Upload all_conversations_cleaned.json to Google Drive root (for IN_JSON path)
+4. Run cells top-to-bottom on Colab GPU runtime
+5. Adapter → HF Hub (HF_HUB_REPO)
+6. Merged model → HF Hub (HF_HUB_REPO + "-merged")  ← use this in production MODEL_NAME
 ```
 
 For a new experiment: copy `qwen_v1.yaml` → `qwen_v2.yaml`, change what you're testing, commit.
@@ -196,5 +192,5 @@ For a new experiment: copy `qwen_v1.yaml` → `qwen_v2.yaml`, change what you're
 |------|-------------|
 | `requirements.txt` | Always — API + frontend |
 | `requirements-data.txt` | Running the OCR data pipeline |
-| `requirements-training.txt` | Running fine-tuning (Colab only) |
+| `requirements-training.txt` | Running fine-tuning (Colab — install via !pip install -r) |
 | `requirements-dev.txt` | Running tests / linting |

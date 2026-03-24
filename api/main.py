@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from api.models import MessageRequest
 from api.llm import generate_replies, stream_ollama_reply
-from api.db import init_db, get_last_messages
+from api.db import init_db, get_last_messages, save_message
 from api.config import settings
 
 
@@ -33,17 +33,31 @@ def root():
 def health():
     return {"status": "ok"}
 
+async def _stream_and_save(conversation_id: str):
+    """Stream Ollama reply to client, then save the full reply to DB."""
+    chunks = []
+    async for chunk in stream_ollama_reply(conversation_id):
+        chunks.append(chunk)
+        yield chunk
+    full_reply = "".join(chunks)
+    if full_reply.strip():
+        save_message(conversation_id, "user", full_reply)
+
+
 @app.post("/suggest_reply")
 async def suggest_reply(frd_msg: MessageRequest):
     try:
         if settings.llm_provider == "ollama":
             return StreamingResponse(
-                stream_ollama_reply(frd_msg.conversation_id),
+                _stream_and_save(frd_msg.conversation_id),
                 media_type="text/plain",
             )
         # openrouter / vllm — non-streaming JSON
         result = await generate_replies(frd_msg.conversation_id)
-        return {"reply": result.get("reply", "")}
+        reply = result.get("reply", "")
+        if reply.strip():
+            save_message(frd_msg.conversation_id, "user", reply)
+        return {"reply": reply}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 

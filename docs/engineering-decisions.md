@@ -175,7 +175,7 @@ The naive approach: edit code in Colab's notebook UI, run there. Problem: you lo
 ```
 VSCode (develop) → git push → Colab (execute)
   !git pull
-  !python training/finetune.py --config training/configs/qwen_v1.yaml
+  Run explore_v2.ipynb top-to-bottom
 ```
 
 The key insight: the round-trip cost (push, switch to Colab, pull, run) is low compared to the cost of developing without an IDE. And because hyperparameters live in YAML config files — not in the script — most experiment iterations only require changing a YAML value and pushing, not touching Python code at all.
@@ -203,7 +203,7 @@ cp training/configs/qwen_v1.yaml training/configs/qwen_v2.yaml
 # Edit: increase LoRA rank from 16 to 32
 git commit -m "experiment: qwen_v2 — higher LoRA rank"
 git push
-# In Colab: !git pull && !python training/finetune.py --config training/configs/qwen_v2.yaml
+# In Colab: !git pull && run explore_v2.ipynb top-to-bottom
 ```
 
 **The lesson:** In ML, reproducibility is correctness. A model that can't be reproduced is just an artifact. Treat experiment configs as code: version them, name them, link them to their outputs.

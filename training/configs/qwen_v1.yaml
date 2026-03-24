@@ -27,7 +27,7 @@ data:
   input_jsonl: "output/unsloth_chatml.jsonl"
 
 prompt:
-  system_file: "training/prompts/system_v1.txt"
+  system_file: "training/prompts/system_v2.txt"
 
 output:
   dir: "lora_outputs/{run_name}"

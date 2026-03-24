@@ -1,0 +1,44 @@
+# Experiment: qwen_v2 — system prompt updated to system_v2.txt (English, detailed)
+# Changes from v1: run_name, output dir, hub_repo, push_to_hub=true
+# To run a new experiment: copy this file, rename (e.g. qwen_v3.yaml), edit, commit, git pull in Colab.
+run_name: "qwen_emotional_v2"
+
+model:
+  name: "unsloth/Qwen2.5-1.5B-Instruct-unsloth-bnb-4bit"
+  max_seq_length: 2048
+  load_in_4bit: true
+
+lora:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+training:
+  per_device_train_batch_size: 2
+  gradient_accumulation_steps: 4   # effective batch size = 8
+  warmup_steps: 50
+  max_steps: 500
+  learning_rate: 2e-4
+  fp16: true
+  logging_steps: 10
+  save_steps: 100
+
+data:
+  input_jsonl: "output/unsloth_chatml.jsonl"
+
+prompt:
+  system_file: "training/prompts/system_v2.txt"
+
+output:
+  dir: "lora_outputs/qwen_emotional_v2"
+  push_to_hub: true
+  # Explicit names: base model + artifact type + version
+  hub_repo_lora_adapter: "Iancheung2288/qwen2.5-1.5b-instruct-emotional-coach-lora-adapter-v2"
+  hub_repo_lora_merged:  "Iancheung2288/qwen2.5-1.5b-instruct-emotional-coach-lora-merged-v2"
+  hub_repo_gguf:         "Iancheung2288/qwen2.5-1.5b-instruct-emotional-coach-gguf-q4km-v2"
+  hub_private: true
+
+wandb:
+  enabled: false                # set to true after `wandb login`
+  project: "emotional-coach"

@@ -30,11 +30,16 @@ from data_pipeline.ocr import get_ocr_engine, run_ocr_with_cache, make_row_id
 
 TIMESTAMP_PATTERN = r'^\s*(昨天|今天|早上|晚上)\s*\d{1,2}:\d{2}\s*$'
 
-SYSTEM_PROMPT = (
-    "你是25歲的人，你的朋友會喜歡跟你聊天，無論是聊日常， 無厘頭， 感情問題，甚至是哲學問題，"
-    "請根據聊天具體情況，帶入聊天，用其中一個或數個：温柔、共情、溫暖，成熟， 搞笑， 調侃的方式 "
-    "或者更適合的方式 回复朋友的消息。根據目前交流的方式，語調延續話題。 不好讓他發現你是機械人。"
+_SYSTEM_PROMPT_FILE = os.path.join(
+    os.path.dirname(__file__), "..", "training", "prompts", "system_v2.txt"
 )
+
+def _load_system_prompt() -> str:
+    path = os.path.normpath(_SYSTEM_PROMPT_FILE)
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+SYSTEM_PROMPT = _load_system_prompt()
 
 
 # ---------- CSV helpers ----------

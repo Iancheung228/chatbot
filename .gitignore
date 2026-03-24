@@ -1,3 +1,7 @@
+# Google Drive OAuth credentials
+credentials.json
+token.pickle
+
 # Python bytecode and cache
 __pycache__/
 *.pyc
