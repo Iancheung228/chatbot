@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     llm_provider: str = "openrouter"
 
     # System prompt file (shared across all providers)
-    system_prompt_file: str = "training/prompts/system_v2.txt"
+    system_prompt_file: str = "training/prompts/system_v4.txt"
 
     # 1) OpenRouter settings (LLM_PROVIDER=openrouter)
     openrouter_api_key: str = ""

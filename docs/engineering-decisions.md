@@ -415,6 +415,81 @@ Verified with `ollama show` — the template was now applied correctly, and resp
 
 ---
 
+---
+
+## Session: 2026-04-04 — API Refactor & Prompt Architecture
+
+### Decision 13: Validation Bug — Dead `message` Field Blocking LLM Calls
+
+`MessageRequest.message` had `min_length=1` but the frontend was sending `""` — the friend's message was already saved to DB before `/suggest_reply` was called, so the field was never needed server-side. FastAPI was silently rejecting every request with 422 before the LLM was ever reached. Fixed by removing `min_length=1`, then later dropping the field entirely once confirmed dead.
+
+---
+
+### Decision 14: Friend Message Save — Direct DB Call Breaks in Production
+
+**The problem:** `frontend/app.py` was calling `save_message()` from `api.db` directly — a Python function call that opens a SQLite file on the local filesystem. In production, Streamlit Cloud and Railway are separate servers with separate disks. The friend's message would write to Streamlit Cloud's ephemeral disk, invisible to the FastAPI backend on Railway.
+
+**The decision:** Added `POST /friend_message` endpoint. Frontend now makes an HTTP request like every other action. All DB writes flow through Railway's disk. The frontend no longer imports anything from `api.db`.
+
+---
+
+### Decision 15: Merged `/log_suggestion` into `/suggest_reply`
+
+**The problem:** After streaming, the frontend reassembled the full reply text client-side and sent it back to the backend via a second HTTP call just to save it. The backend had generated that text and discarded it.
+
+**The decision:** Backend accumulates chunks during streaming, saves to DB itself, and emits a final NDJSON line `{"done": true, "suggestion_id": N}`. Non-streaming path includes `suggestion_id` directly in the JSON response. One round trip instead of two. `LogSuggestionRequest` and the `/log_suggestion` endpoint deleted entirely.
+
+**Streaming format change:** Plain text chunks → NDJSON (`{"chunk": "..."}` lines). Gives the frontend a structured protocol to display chunks and extract the suggestion ID cleanly from the terminal line.
+
+---
+
+### Decision 16: Kept `sent=0` Rows as Training Data
+
+Initially flagged as DB bloat. Reversed after reflection — `sent=0` unambiguously means "LLM suggested this, user chose not to use it." This is a valuable negative training signal. No cleanup logic added. Future training queries:
+
+```sql
+SELECT * FROM messages WHERE sender='llm' AND sent=1;  -- accepted (positive)
+SELECT * FROM messages WHERE sender='llm' AND sent=0;  -- rejected (negative)
+```
+
+---
+
+### Decision 17: Chat UI Placeholder Moved to Top of Script
+
+`display_chat_ui()` was called at the bottom of the Streamlit script. During streaming the script was blocked mid-execution — the placeholder stayed empty until streaming finished, making the chat window disappear. Moved the call immediately after `st.empty()` so chat history renders before streaming begins and stays visible throughout.
+
+---
+
+### Decision 18: Input Box Wrapped in `st.form`
+
+Streamlit text areas don't commit their value to session state until the widget loses focus (blur). Users had to click outside the box before clicking a button — an unintuitive UX gap. Wrapping in `st.form` batches the text area value and button click together so clicking submit commits both simultaneously without needing to click away.
+
+---
+
+### Decision 19: Conversation Summarizer
+
+**The problem:** `get_last_messages(n=20)` creates a hard cutoff — everything before message 20 is invisible to the LLM. Longer conversations lose context.
+
+**The decision:** `maybe_summarize()` runs before every LLM call. Trigger: `(total_messages - 20) % 5 == 0` — once every 5 new messages past the window. Incremental: passes existing summary + new overflow to the LLM so each new summary builds on the last rather than reprocessing the entire history. Saved to the existing `summaries` table in SQLite.
+
+---
+
+### Decision 20: History Embedded in System Prompt, Not as Separate ChatML Turns
+
+**Context:** Decision 11 established that history should be proper ChatML turns, not flat text in the system message. This was the right call at the time — training data used multi-turn ChatML. With the introduction of `{HISTORY}` as a system prompt placeholder, we reversed this.
+
+**The reasoning:** The `{HISTORY}` placeholder formats messages as `Friend: ...` / `You: ...` lines directly inside the system message. This removes the separate `user`/`assistant` turn array from the payload entirely. Benefits: the debug terminal log is fully self-contained (one JSON block shows everything), no duplication, and the prompt caching architecture (static content first, dynamic content last) is easier to maintain in one place. The trade-off is a departure from strict ChatML formatting — acceptable because the production model (vLLM/RunPod) will be a general instruction model handling this naturally, and the Ollama path is already on custom GGUF with a configured template.
+
+---
+
+### Decision 21: Standardised Naming in system_v3.txt
+
+**The problem:** Examples used `U:` / `A:` (ChatML jargon — "User", "Assistant"), while the `{HISTORY}` block produced by the code used `Friend:` / `You:`. The LLM saw different naming conventions in the instructions versus the actual conversation data it was replying to — a subtle inconsistency that could cause the model to treat the examples as a different format than the real context.
+
+**The decision:** Replaced all `U:` → `Friend:`, all `A:` → `You:` throughout the prompt. Defined both terms explicitly at the top as a glossary. Every reference in instructions, examples, and section headers now uses the same two labels the LLM sees in `{HISTORY}`.
+
+---
+
 ## What's Next
 
 **Completed:**

@@ -57,16 +57,16 @@ The `.env` file is the only switch between dev and production — no code change
 
 ```bash
 # LOCAL DEV
-LLM_BACKEND=openrouter
+LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-...
 MODEL_NAME=openai/gpt-4o-mini
 
 # PRODUCTION (set as env vars on Railway + Streamlit Cloud)
-LLM_BACKEND=openrouter          # vLLM speaks the same OpenAI-compatible API
-BASE_URL=https://YOUR-RUNPOD.proxy.runpod.net/v1
-OPENROUTER_API_KEY=your-vllm-token
-MODEL_NAME=yourname/qwen-emotional-coach-v1-merged
-API_BASE_URL=https://your-app.railway.app
+LLM_PROVIDER=vllm
+VLLM_BASE_URL=https://YOUR-RUNPOD.proxy.runpod.net/v1
+VLLM_API_KEY=your-vllm-token
+VLLM_MODEL=yourname/qwen-emotional-coach-v1-merged
+API_BASE_URL=https://your-app.railway.app   # REQUIRED on Streamlit Cloud
 DB_PATH=/data/chatbot.db
 ```
 
@@ -98,9 +98,8 @@ chatbot/
 | File | Role |
 |------|------|
 | `api/config.py` | All settings via pydantic-settings. Single source of truth for env vars. |
-| `api/llm.py` | OpenRouter/vLLM calls + `build_prompt()` + `ocr_to_smart_text()` |
-| `api/llm_local.py` | Ollama client — identical interface to `llm.py` |
-| `api/db.py` | SQLite conversation history (save_message, get_last_messages, get_latest_summary) |
+| `api/llm.py` | All LLM backends (OpenRouter, vLLM, Ollama) + `build_api_payload()` + streaming |
+| `api/db.py` | SQLite conversation history (save_message, log_llm_suggestion, get_last_messages) |
 | `data_pipeline/ocr.py` | PaddleOCR helpers: `get_ocr_engine`, `run_ocr_with_cache`, `parse_paddle_result_dict` |
 | `data_pipeline/process.py` | Pipeline orchestration: `process_all_root`, `reconcile_rows`, `to_jsonl` |
 | `training/configs/qwen_v1.yaml` | Baseline experiment config — copy to start a new experiment |
@@ -138,17 +137,18 @@ Switch between any OpenAI-compatible LLM by changing `.env` only:
 
 ```bash
 # Dev — OpenRouter (cheap, no GPU)
-LLM_BACKEND=openrouter
+LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=sk-...
 MODEL_NAME=openai/gpt-4o-mini           # or meta-llama/llama-3-8b-instruct, etc.
 
 # Prod — vLLM serving fine-tuned Qwen on RunPod
-LLM_BACKEND=openrouter                  # same code path — vLLM is OpenAI-compatible
-BASE_URL=https://YOUR-RUNPOD.proxy.runpod.net/v1
-MODEL_NAME=yourname/qwen-emotional-coach-v1-merged
+LLM_PROVIDER=vllm
+VLLM_BASE_URL=https://YOUR-RUNPOD.proxy.runpod.net/v1
+VLLM_API_KEY=your-vllm-token
+VLLM_MODEL=yourname/qwen-emotional-coach-v1-merged
 
 # Local — Ollama
-LLM_BACKEND=ollama
+LLM_PROVIDER=ollama
 OLLAMA_MODEL=qwen-emotional-coach
 ```
 
@@ -183,6 +183,35 @@ For a new experiment: copy `qwen_v1.yaml` → `qwen_v2.yaml`, change what you're
 | `requirements*.txt` | `convos_folder76/` (raw image data, large) |
 | `Dockerfile`, `docker-compose.yml` | `*.csv`, `*.db`, `*.zip` |
 | `.env.example` | |
+
+---
+
+## Prompt Caching
+
+LLM backends cache the KV-states for tokens they've already computed. When consecutive requests share an identical prefix, those tokens are not re-processed — saving latency and (on paid APIs) cost. The cacheable prefix must be **byte-for-byte identical** up to the cache boundary.
+
+### How each backend handles it
+
+| Backend | Mechanism | Action required |
+|---------|-----------|-----------------|
+| **Ollama** (local dev) | Automatic llama.cpp prefix caching | None — works out of the box |
+| **vLLM** (RunPod, prod) | Automatic prefix caching | None — enabled by default |
+| **OpenRouter → Anthropic** | Explicit opt-in | Add `"cache_control": {"type": "ephemeral"}` to the message (not yet implemented) |
+
+### Why `{SUMMARY}` must stay at the END of the system prompt
+
+The system prompt in `training/prompts/system_v3.txt` is structured as:
+
+```
+[static: Role, Protocol, Rules, Examples, Core Identity]  ← ~600 tokens, fully cacheable
+---
+# Conversation Context
+{SUMMARY}                                                  ← dynamic, per-conversation
+```
+
+Any token after a change breaks the cache. Keeping the static body first means ~600 tokens are cached after the first request. If `{SUMMARY}` were moved back toward the top (as in v3's original position), only ~80 tokens would be cacheable.
+
+**Do not move `{SUMMARY}` to the middle or top of the system prompt** when editing future prompt versions.
 
 ---
 

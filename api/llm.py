@@ -8,8 +8,11 @@ Switch providers by setting LLM_PROVIDER in .env:
 """
 import httpx
 import json
+import logging
 from api.config import settings
-from api.db import get_latest_summary, get_last_messages
+from api.db import get_latest_summary, get_last_messages, get_all_messages, save_summary
+
+logger = logging.getLogger(__name__)
 
 
 _SYSTEM_PROMPT: str = ""
@@ -24,27 +27,35 @@ def _get_system_prompt() -> str:
 
 
 def build_system_prompt(conversation_id: str) -> str:
-    """System message: persona instructions + optional prior summary. No history."""
-    parts = [_get_system_prompt()]
+    """System message: persona instructions with {SUMMARY} injected."""
+    base = _get_system_prompt()
     summary = get_latest_summary(conversation_id)
-    if summary:
-        parts.append(f"---\n\nConversation summary so far:\n{summary}")
-    return "\n\n".join(parts)
+    summary_block = (
+        f"Prior conversation summary:\n{summary}"
+        if summary
+        else "(none — conversation is short enough to fit in full below)"
+    )
+    return base.replace("{SUMMARY}", summary_block)
 
 
-def build_messages(conversation_id: str) -> list[dict]:
+def build_api_payload(conversation_id: str) -> list[dict]:
     """
-    Build the full messages array for the LLM call.
+    Build the messages array for the LLM call.
 
-    Conversation history from DB is mapped to ChatML roles:
-        DB sender "friend"  → role "user"      (the person we reply to)
-        DB sender "user"    → role "assistant"  (our previous replies)
+    History is passed as proper ChatML turns — the same format the model
+    was trained on. This prevents the model from pattern-matching the flat
+    text history against the examples and hallucinating a continuation.
 
-    The current friend message is already the last DB entry — it was saved
-    in frontend.py before /suggest_reply is called.
-    Consecutive messages from the same sender are merged (WeChat short bursts).
+        DB sender "friend" → role "user"      (the person we reply to)
+        DB sender "user"   → role "assistant" (our previous replies)
+        DB sender "llm"    → role "assistant" (accepted LLM suggestions)
+
+    Consecutive messages from the same role are merged (WeChat short bursts).
+    The friend's latest message is already the last DB entry (saved before
+    /suggest_reply is called), so the model sees it as the open user turn
+    it needs to respond to.
     """
-    role_map = {"friend": "user", "user": "assistant"}
+    role_map = {"friend": "user", "user": "assistant", "llm": "assistant"}
     history = get_last_messages(conversation_id, n=20)
 
     chat_messages: list[dict] = []
@@ -55,10 +66,21 @@ def build_messages(conversation_id: str) -> list[dict]:
         else:
             chat_messages.append({"role": role, "content": content})
 
-    return [
+    messages = [
         {"role": "system", "content": build_system_prompt(conversation_id)},
         *chat_messages,
     ]
+
+    logger.info(
+        "\n" + "=" * 60 + "\n"
+        "LLM PAYLOAD  conversation_id=%s\n"
+        + "=" * 60 + "\n"
+        + json.dumps(messages, ensure_ascii=False, indent=2)
+        + "\n" + "=" * 60,
+        conversation_id,
+    )
+
+    return messages
 
 
 async def _call_openai_compatible(
@@ -73,7 +95,7 @@ async def _call_openai_compatible(
     }
     payload = {
         "model": model,
-        "messages": build_messages(conversation_id),
+        "messages": build_api_payload(conversation_id),
         "temperature": 0.8,
     }
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -90,7 +112,7 @@ async def _call_openai_compatible(
 async def _call_ollama(conversation_id: str) -> dict:
     payload = {
         "model": settings.ollama_model,
-        "messages": build_messages(conversation_id),
+        "messages": build_api_payload(conversation_id),
         "stream": False,
     }
     async with httpx.AsyncClient(timeout=60.0) as client:
@@ -108,7 +130,7 @@ async def stream_ollama_reply(conversation_id: str):
     """Async generator: yields text chunks from Ollama as they're produced."""
     payload = {
         "model": settings.ollama_model,
-        "messages": build_messages(conversation_id),
+        "messages": build_api_payload(conversation_id),
         "stream": True,
         "options": {"num_predict": 400},
     }
@@ -122,6 +144,86 @@ async def stream_ollama_reply(conversation_id: str):
                     data = json.loads(line)
                     if not data.get("done"):
                         yield data["message"]["content"]
+
+
+_HISTORY_WINDOW = 20   # messages kept verbatim in every LLM call
+_SUMMARIZE_EVERY = 5   # summarize once per N new messages beyond the window
+
+
+async def _generate_summary(overflow: list[tuple[str, str]], existing_summary: str) -> str:
+    """
+    Call the LLM to produce an updated summary of overflow messages.
+    Uses OpenRouter/vLLM if available, falls back to Ollama.
+    Always uses a cheap/fast model — this is a housekeeping call, not a reply.
+    """
+    label = {"friend": "Friend", "user": "You", "llm": "You"}
+    transcript = "\n".join(
+        f"{label.get(sender, sender)}: {content}" for sender, content in overflow
+    )
+    prior_block = f"Existing summary:\n{existing_summary}\n\n" if existing_summary else ""
+    prompt = (
+        f"{prior_block}"
+        f"New messages to incorporate:\n{transcript}\n\n"
+        "Write a concise factual summary (3-6 sentences) of the relationship context, "
+        "key topics discussed, and emotional tone so far. "
+        "This summary will be shown to an AI playing the role of a close friend "
+        "so it can maintain continuity. Do not invent anything not in the messages."
+    )
+    messages = [{"role": "user", "content": prompt}]
+
+    provider = settings.llm_provider
+    if provider == "ollama":
+        payload = {"model": settings.ollama_model, "messages": messages, "stream": False}
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{settings.ollama_base_url}/api/chat", json=payload)
+            resp.raise_for_status()
+            return resp.json()["message"]["content"]
+
+    if provider == "vllm":
+        base_url, api_key, model = settings.vllm_base_url, settings.vllm_api_key, settings.vllm_model
+    else:
+        base_url, api_key, model = settings.base_url, settings.openrouter_api_key, settings.model_name
+
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.post(
+            f"{base_url}/chat/completions",
+            headers=headers,
+            json={"model": model, "messages": messages, "temperature": 0.3},
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
+async def maybe_summarize(conversation_id: str) -> None:
+    """
+    Trigger a summary update if the conversation has grown beyond the history window.
+    Runs every _SUMMARIZE_EVERY messages past the window so the summary stays fresh
+    without making an extra LLM call on every single turn.
+    """
+    all_messages = get_all_messages(conversation_id)
+    total = len(all_messages)
+
+    if total <= _HISTORY_WINDOW:
+        return  # everything fits in the window — no summary needed
+
+    overflow_count = total - _HISTORY_WINDOW
+    if overflow_count % _SUMMARIZE_EVERY != 0:
+        return  # not a summarization checkpoint yet
+
+    overflow = all_messages[:overflow_count]
+    existing_summary = get_latest_summary(conversation_id)
+
+    logger.info(
+        "Summarizing conversation_id=%s: %d overflow messages (existing summary: %s)",
+        conversation_id,
+        len(overflow),
+        "yes" if existing_summary else "none",
+    )
+
+    summary = await _generate_summary(overflow, existing_summary)
+    save_summary(conversation_id, summary)
+    logger.info("Summary saved for conversation_id=%s", conversation_id)
 
 
 async def generate_replies(conversation_id: str) -> dict:

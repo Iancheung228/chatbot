@@ -6,65 +6,162 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = settings.db_path
 
+
 def init_db():
-    # Use 'with' to connect to the SQLite database and automatically close the connection when done
     with sqlite3.connect(DB_PATH) as conn:
-        # Create a cursor object 
         c = conn.cursor()
 
-        create_messages_table = """
+        c.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT,
                 sender TEXT,
                 content TEXT,
+                sent INTEGER DEFAULT 1,
+                source TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """
-        create_summaries_table = """
+        """)
+        c.execute("""
             CREATE TABLE IF NOT EXISTS summaries (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 conversation_id TEXT,
                 summary TEXT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """
-        c.execute(create_messages_table)
-        c.execute(create_summaries_table)
+        """)
         c.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_summaries_conv ON summaries (conversation_id)")
+
+        # Migrations for existing databases that pre-date these columns.
+        # ALTER TABLE ADD COLUMN does not set DEFAULT on existing rows in all
+        # SQLite versions, so we explicitly backfill NULLs after each migration.
+        _migrations = [
+            ("sent",   "INTEGER DEFAULT 1", "UPDATE messages SET sent = 1 WHERE sent IS NULL"),
+            ("source", "TEXT",              None),
+        ]
+        for col, definition, backfill_sql in _migrations:
+            try:
+                c.execute(f"ALTER TABLE messages ADD COLUMN {col} {definition}")
+                logger.info("Migration: added column '%s' to messages", col)
+                if backfill_sql:
+                    c.execute(backfill_sql)
+                    logger.info("Migration: backfilled '%s'", col)
+            except sqlite3.OperationalError:
+                pass  # column already exists — nothing to do
+
         conn.commit()
         logger.info("Database tables initialized")
 
-def save_message(conversation_id, sender, content):
+
+def save_message(conversation_id: str, sender: str, content: str,
+                 sent: int = 1, source: str | None = None) -> int:
+    """Insert a message row. Returns the new row id."""
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        #instead of writing SQL directly in our Python script with hardcoded values, we’ll use parameterized queries to make our code more secure and flexible.
-        
-        insert_to_msg_table = '''
-        INSERT INTO messages (conversation_id, sender, content) VALUES (?, ?, ?)'''
-
-        msg_data = (conversation_id, sender, content)
-        c.execute(insert_to_msg_table, msg_data)
+        c.execute(
+            "INSERT INTO messages (conversation_id, sender, content, sent, source)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (conversation_id, sender, content, sent, source),
+        )
         conn.commit()
-        logger.debug("Message saved: conversation_id=%s sender=%s", conversation_id, sender)
+        row_id = c.lastrowid
+        logger.debug(
+            "Message saved: id=%s conversation_id=%s sender=%s sent=%s source=%s",
+            row_id, conversation_id, sender, sent, source,
+        )
+    return row_id
 
-def get_last_messages(conversation_id, n=10):
+
+def log_llm_suggestion(conversation_id: str, content: str) -> int:
+    """
+    Persist an LLM-generated suggestion before the user has accepted it.
+    Stored as sender='llm', sent=0.
+    Returns the new row id (used as suggestion_id in the frontend).
+    """
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("SELECT sender, content FROM messages WHERE conversation_id=? ORDER BY timestamp DESC, id DESC LIMIT ?", (conversation_id, n))
+        c.execute(
+            "INSERT INTO messages (conversation_id, sender, content, sent)"
+            " VALUES (?, 'llm', ?, 0)",
+            (conversation_id, content),
+        )
+        conn.commit()
+        suggestion_id = c.lastrowid
+        logger.debug(
+            "LLM suggestion logged: id=%s conversation_id=%s", suggestion_id, conversation_id
+        )
+    return suggestion_id
+
+
+def mark_suggestion_sent(suggestion_id: int) -> bool:
+    """
+    Mark a pending LLM suggestion as accepted (sent=1).
+    Only updates rows where sender='llm' AND sent=0 — prevents double-accept.
+    Returns True if the row was found and updated, False otherwise.
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "UPDATE messages SET sent = 1 WHERE id = ? AND sender = 'llm' AND sent = 0",
+            (suggestion_id,),
+        )
+        conn.commit()
+        found = c.rowcount > 0
+        if not found:
+            logger.warning(
+                "mark_suggestion_sent: id=%s not found or already sent", suggestion_id
+            )
+    return found
+
+
+def get_all_messages(conversation_id: str) -> list[tuple[str, str]]:
+    """Return all confirmed (sent=1) messages in chronological order. No limit."""
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT sender, content FROM messages"
+            " WHERE conversation_id = ? AND sent = 1"
+            " ORDER BY timestamp ASC, id ASC",
+            (conversation_id,),
+        )
+        return c.fetchall()
+
+
+def get_last_messages(conversation_id: str, n: int = 10) -> list[tuple[str, str]]:
+    """
+    Return the last n *sent* messages (sent=1) in chronological order.
+    Excludes unaccepted LLM suggestions (sent=0).
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            "SELECT sender, content FROM messages"
+            " WHERE conversation_id = ? AND sent = 1"
+            " ORDER BY timestamp DESC, id DESC LIMIT ?",
+            (conversation_id, n),
+        )
         messages = c.fetchall()
     return messages[::-1]  # reverse to chronological order
 
-def save_summary(conversation_id, summary):
+
+def save_summary(conversation_id: str, summary: str) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("INSERT INTO summaries (conversation_id, summary) VALUES (?, ?)", (conversation_id, summary))
+        c.execute(
+            "INSERT INTO summaries (conversation_id, summary) VALUES (?, ?)",
+            (conversation_id, summary),
+        )
         conn.commit()
 
-def get_latest_summary(conversation_id):
+
+def get_latest_summary(conversation_id: str) -> str:
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("SELECT summary FROM summaries WHERE conversation_id=? ORDER BY timestamp DESC LIMIT 1", (conversation_id,))
+        c.execute(
+            "SELECT summary FROM summaries WHERE conversation_id = ?"
+            " ORDER BY timestamp DESC LIMIT 1",
+            (conversation_id,),
+        )
         row = c.fetchone()
     return row[0] if row else ""
