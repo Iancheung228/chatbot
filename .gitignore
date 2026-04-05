@@ -30,6 +30,7 @@ output/
 *.zip
 convos_folder76/
 data_pipeline/chat_dataset_wip/
+training/all_conversations_cleaned.json
 
 # Model weights and LoRA outputs (store on HF Hub / Google Drive, not git)
 *.pt
