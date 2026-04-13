@@ -10,7 +10,7 @@ import httpx
 import json
 import logging
 from api.config import settings
-from api.db import get_latest_summary, get_last_messages, get_all_messages, save_summary
+from api.db import get_latest_summary, get_last_messages, get_all_messages, save_summary, save_suggestion_score
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +224,141 @@ async def maybe_summarize(conversation_id: str) -> None:
     summary = await _generate_summary(overflow, existing_summary)
     save_summary(conversation_id, summary)
     logger.info("Summary saved for conversation_id=%s", conversation_id)
+
+
+_JUDGE_SYSTEM_PROMPT = """\
+你是一个专业的中文对话质量评估员。你的任务是评估一条建议回复的质量。
+根据以下5个维度打分（每项1-5分），并给出简短理由。
+只输出合法JSON，不要任何解释文字或Markdown。
+
+评分维度与标准：
+
+1. 节奏感 (rhythm)
+   - 是否给对方留了回应空间？
+   - 是否连续发了多条消息？
+   - 是否在对方还没回应时就继续追问？
+   5=节奏自然，留有空间；1=信息轰炸，让人喘不过气
+
+2. 真诚度 (authenticity)
+   - 表达是否自然，还是明显在"套话"？
+   - 是否有刻意表现或过度包装的痕迹？
+   - 用词是否符合两人当前关系的亲密程度？
+   5=自然真实，像真人在说话；1=像客服或贺卡，明显套路
+
+3. 推进感 (momentum)
+   - 这轮对话是否推进了关系/话题深度？
+   - 是否停留在表面，没有任何深入？
+   - 推进是否过猛，让对方感到压力？
+   5=自然推进，恰到好处；1=原地踏步或用力过猛
+
+4. 情绪感知 (emotional_match)
+   - 是否识别了对方的情绪信号？
+   - 对方给出冷淡回应时，是否注意到并调整了策略？
+   - 是否在对方热情时顺势推进？
+   5=精准读懂情绪，回应恰当；1=对情绪信号完全忽视
+
+5. 钩子感 (hook_quality)
+   - 回复是否以自然的方式邀请对方继续聊？
+   - 是否有问题、回调、小玩笑或留白让对方想回应？
+   5=让人忍不住想回复；1=对话终结者
+
+6. 人味感 (ai_naturalness) — AI味检测，越高越像真人
+   - 是否出现了AI常见套路？（"我理解你的感受"、"我会支持你"、"没问题"、"加油"等空洞鼓励）
+   - 回复结构是否过于工整，像在执行模板而非随口一说？
+   - 是否有不必要的总结句或收尾语？（"总的来说"、"希望对你有帮助"等）
+   - 语气是否足够随意、有个性，像真实的人在聊天？
+   - 有没有具体细节、个人反应、或带点情绪色彩——而不是泛泛而谈？
+   5=完全像真人，有个性有温度；1=明显是AI在说话，套路满满
+
+输出格式：
+{
+  "rhythm": <1-5>,
+  "authenticity": <1-5>,
+  "momentum": <1-5>,
+  "emotional_match": <1-5>,
+  "hook_quality": <1-5>,
+  "ai_naturalness": <1-5>,
+  "justifications": {
+    "rhythm": "<一句话理由>",
+    "authenticity": "<一句话理由>",
+    "momentum": "<一句话理由>",
+    "emotional_match": "<一句话理由>",
+    "hook_quality": "<一句话理由>",
+    "ai_naturalness": "<一句话理由>"
+  }
+}"""
+
+
+async def judge_reply(
+    suggestion_id: int,
+    conversation_id: str,
+    candidate_reply: str,
+) -> None:
+    """
+    Call GPT-4o-mini to score a candidate reply on 5 dimensions.
+    Runs as a background task — never raises, logs warnings on failure.
+    """
+    label = {"friend": "对方", "user": "你", "llm": "你"}
+    history = get_last_messages(conversation_id, n=10)
+    history_text = "\n".join(
+        f"{label.get(sender, sender)}: {content}" for sender, content in history
+    )
+    user_content = (
+        f"对话记录（时间顺序）：\n{history_text}\n\n"
+        f"待评估的建议回复：\n{candidate_reply}"
+    )
+    messages = [
+        {"role": "system", "content": _JUDGE_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+    try:
+        headers = {
+            "Authorization": f"Bearer {settings.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": settings.judge_model,
+            "messages": messages,
+            "temperature": 0.0,
+        }
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{settings.base_url}/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"]
+
+        # Strip markdown code fences if the model wrapped the JSON
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = clean.split("```")[1]
+            if clean.startswith("json"):
+                clean = clean[4:]
+            clean = clean.strip()
+
+        data = json.loads(clean)
+        weights = {"rhythm": 0.12, "authenticity": 0.18, "momentum": 0.15,
+                   "emotional_match": 0.18, "hook_quality": 0.12, "ai_naturalness": 0.25}
+        overall = sum(data.get(k, 0) * w for k, w in weights.items()) * 20
+        data["overall_score"] = round(overall, 1)
+
+        save_suggestion_score(
+            suggestion_id=suggestion_id,
+            conversation_id=conversation_id,
+            scores=data,
+            judge_model=settings.judge_model,
+            raw_response=raw,
+        )
+        logger.info(
+            "Judge score saved: suggestion_id=%s overall=%.1f", suggestion_id, overall
+        )
+    except Exception:
+        logger.warning(
+            "judge_reply failed for suggestion_id=%s", suggestion_id, exc_info=True
+        )
 
 
 async def generate_replies(conversation_id: str) -> dict:

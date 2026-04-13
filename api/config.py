@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     vllm_api_key: str = ""
     vllm_model: str = ""
 
+    # Judge settings
+    judge_model: str = "openai/gpt-4o-mini"
+
     # App settings
     db_path: str = "chatbot.db"
     api_base_url: str = "http://127.0.0.1:8000"

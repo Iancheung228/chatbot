@@ -1,13 +1,14 @@
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
 
 logging.basicConfig(level=logging.INFO)
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from api.models import MessageRequest, SendUserMessageRequest, FriendMessageRequest
-from api.llm import generate_replies, stream_ollama_reply, maybe_summarize
+from api.llm import generate_replies, stream_ollama_reply, maybe_summarize, judge_reply
 from api.db import (
     init_db, get_last_messages, save_message,
     log_llm_suggestion, mark_suggestion_sent,
@@ -49,13 +50,16 @@ async def _stream_reply(conversation_id: str):
     Accumulates the full text, saves it to DB on completion, and emits a
     final {"done": true, "suggestion_id": <id>} line so the frontend gets
     the suggestion_id without a second round trip.
+    Fires the judge as a background asyncio task after streaming finishes.
     """
     full_text = []
     async for chunk in stream_ollama_reply(conversation_id):
         full_text.append(chunk)
         yield json.dumps({"chunk": chunk}) + "\n"
-    suggestion_id = log_llm_suggestion(conversation_id, "".join(full_text))
+    candidate = "".join(full_text)
+    suggestion_id = log_llm_suggestion(conversation_id, candidate)
     yield json.dumps({"done": True, "suggestion_id": suggestion_id}) + "\n"
+    asyncio.create_task(judge_reply(suggestion_id, conversation_id, candidate))
 
 
 @app.post("/friend_message")
@@ -66,7 +70,7 @@ def friend_message(req: FriendMessageRequest):
 
 
 @app.post("/suggest_reply")
-async def suggest_reply(frd_msg: MessageRequest):
+async def suggest_reply(frd_msg: MessageRequest, background_tasks: BackgroundTasks):
     """
     Generate a reply suggestion and save it to DB as sent=0 (pending).
 
@@ -74,6 +78,7 @@ async def suggest_reply(frd_msg: MessageRequest):
     Others  → JSON {"reply": "...", "suggestion_id": N}
 
     The suggestion_id is used by /send_user_message to confirm or discard the suggestion.
+    After returning, a background task scores the suggestion via the LLM judge.
     """
     try:
         await maybe_summarize(frd_msg.conversation_id)
@@ -85,6 +90,9 @@ async def suggest_reply(frd_msg: MessageRequest):
         result = await generate_replies(frd_msg.conversation_id)
         reply = result.get("reply", "")
         suggestion_id = log_llm_suggestion(frd_msg.conversation_id, reply)
+        background_tasks.add_task(
+            judge_reply, suggestion_id, frd_msg.conversation_id, reply
+        )
         return {"reply": reply, "suggestion_id": suggestion_id}
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))

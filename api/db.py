@@ -30,8 +30,33 @@ def init_db():
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS suggestion_scores (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                suggestion_id   INTEGER NOT NULL,
+                conversation_id TEXT NOT NULL,
+                rhythm          REAL,
+                authenticity    REAL,
+                momentum        REAL,
+                emotional_match REAL,
+                hook_quality    REAL,
+                ai_naturalness  REAL,
+                overall_score   REAL,
+                justifications  TEXT,
+                judge_model     TEXT,
+                created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                raw_response    TEXT
+            )
+        """)
+        try:
+            c.execute("ALTER TABLE suggestion_scores ADD COLUMN ai_naturalness REAL")
+            logger.info("Migration: added column 'ai_naturalness' to suggestion_scores")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         c.execute("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_summaries_conv ON summaries (conversation_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_scores_conv ON suggestion_scores (conversation_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_scores_suggestion ON suggestion_scores (suggestion_id)")
 
         # Migrations for existing databases that pre-date these columns.
         # ALTER TABLE ADD COLUMN does not set DEFAULT on existing rows in all
@@ -165,3 +190,43 @@ def get_latest_summary(conversation_id: str) -> str:
         )
         row = c.fetchone()
     return row[0] if row else ""
+
+
+def save_suggestion_score(
+    suggestion_id: int,
+    conversation_id: str,
+    scores: dict,
+    judge_model: str,
+    raw_response: str,
+) -> None:
+    """Persist LLM judge scores for a suggestion. scores keys: rhythm, authenticity,
+    momentum, emotional_match, hook_quality, ai_naturalness, overall_score,
+    justifications (JSON str)."""
+    import json
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO suggestion_scores
+                (suggestion_id, conversation_id, rhythm, authenticity, momentum,
+                 emotional_match, hook_quality, ai_naturalness, overall_score,
+                 justifications, judge_model, raw_response)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                suggestion_id,
+                conversation_id,
+                scores.get("rhythm"),
+                scores.get("authenticity"),
+                scores.get("momentum"),
+                scores.get("emotional_match"),
+                scores.get("hook_quality"),
+                scores.get("ai_naturalness"),
+                scores.get("overall_score"),
+                json.dumps(scores.get("justifications", {}), ensure_ascii=False),
+                judge_model,
+                raw_response,
+            ),
+        )
+        conn.commit()
+    logger.debug("Judge score saved: suggestion_id=%s overall=%.1f", suggestion_id, scores.get("overall_score", 0))
