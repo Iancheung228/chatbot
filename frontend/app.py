@@ -12,6 +12,31 @@ import uuid
 st.title("Message Coach 🤖💬")
 
 # ---------------------------------------------------------------------------
+# Sidebar — pipeline + model toggles
+# ---------------------------------------------------------------------------
+pipeline = st.sidebar.radio(
+    "Reply pipeline",
+    options=["single", "two_step", "two_step_all", "three_step"],
+    index=0,
+    help=(
+        "single: one-shot, full context → reply\n"
+        "two_step: GPT-4o-mini picks best direction → reply model refines\n"
+        "two_step_all: GPT-4o-mini brainstorms all directions → reply model picks any\n"
+        "three_step: GPT-4o-mini generates 3 candidates → selects+refines → reply model delivers"
+    ),
+)
+
+reply_model = st.sidebar.selectbox(
+    "Reply model",
+    options=["qwen-local", "gpt-4o-mini"],
+    format_func=lambda m: {
+        "qwen-local":  "Qwen 2.5 (fine-tuned, local)",
+        "gpt-4o-mini": "GPT-4o-mini (OpenRouter)",
+    }.get(m, m),
+    help="qwen-local streams via Ollama; gpt-4o-mini uses OpenRouter (non-streaming)",
+)
+
+# ---------------------------------------------------------------------------
 # Session state initialisation
 # ---------------------------------------------------------------------------
 if "conversation_id" not in st.session_state:
@@ -99,6 +124,42 @@ if st.session_state["suggestions"]:
             col_text, col_btn = st.columns([4, 1])
             with col_text:
                 st.write(f"**#{idx + 1}** {suggestion['text']}")
+                st.caption(f"pipeline: {suggestion.get('pipeline', 'single')} | model: {suggestion.get('reply_model', 'qwen-local')}")
+                s1 = suggestion.get("step1")
+                s2 = suggestion.get("step2")
+                if s1 or s2:
+                    with st.expander("🔍 Pipeline reasoning"):
+                        if s1:
+                            analysis = s1.get("analysis", {})
+                            st.markdown(f"**Emotion:** {analysis.get('emotion', '—')} · **Energy:** {analysis.get('energy', '—')}")
+                            kws = analysis.get("keywords", [])
+                            if kws:
+                                st.markdown("**Keywords:** " + " · ".join(f"`{k['word']}` — {k['significance']}" for k in kws))
+
+                        if s1 and s2:
+                            directions = s1.get("directions", [])
+                            evaluations = s2.get("evaluations", [])
+                            selected = s2.get("selected")
+                            dims = ["specificity", "need_accuracy", "peer_authenticity", "respect", "engagement", "originality"]
+                            dim_labels = ["Specific", "Need", "Authentic", "Respect", "Hook", "Original"]
+
+                            if directions:
+                                st.markdown("**Step 1 → Step 2: Candidate scores**")
+                                # Build score lookup by index
+                                scores_by_idx = {e["index"]: e.get("scores", {}) for e in evaluations}
+                                for i, d in enumerate(directions):
+                                    sc = scores_by_idx.get(i, {})
+                                    total = sum(sc.get(dim, 0) for dim in dims)
+                                    is_selected = (i == selected)
+                                    prefix = "✅ " if is_selected else f"{i+1}. "
+                                    score_str = " · ".join(f"{lbl} **{sc.get(dim, '—')}**" for lbl, dim in zip(dim_labels, dims))
+                                    st.markdown(f"{prefix}**{d.get('angle', '')}** — total {total}/18  \n{score_str}  \n*Draft:* {d.get('draft', '')}")
+
+                        if s2:
+                            st.markdown("**Step 2 — Refined direction:**")
+                            if s2.get("reasoning"):
+                                st.markdown(f"*{s2['reasoning']}*")
+                            st.markdown(f"→ **{s2.get('angle', '')}**  \n*Draft:* {s2.get('draft', '')}")
             with col_btn:
                 def _use_suggestion(text=suggestion["text"], sid=suggestion["suggestion_id"]):
                     st.session_state["num_input_box"] = text
@@ -207,12 +268,13 @@ if st.session_state["pending_llm_call"]:
     conv_id = st.session_state["conversation_id"]
     suggestion_text = ""
     suggestion_id = None
+    step1 = step2 = None
 
     with st.spinner("Generating suggestion..."):
         try:
             response = requests.post(
                 f"{API_BASE}/suggest_reply",
-                json={"conversation_id": conv_id},
+                json={"conversation_id": conv_id, "pipeline": pipeline, "reply_model": reply_model},
                 stream=True,
                 timeout=120,
             )
@@ -223,12 +285,15 @@ if st.session_state["pending_llm_call"]:
                     data = response.json()
                     suggestion_text = data.get("reply", "")
                     suggestion_id = data.get("suggestion_id")
+                    step1 = data.get("step1")
+                    step2 = data.get("step2")
                     if suggestion_text:
                         st.write(suggestion_text)
                 else:
                     # Ollama NDJSON streaming path
-                    # Each line: {"chunk": "..."} or final {"done": true, "suggestion_id": N}
-                    _state = {"suggestion_id": None}
+                    # Lines: {"step1": {...}}, {"step2": {...}}, {"brainstorm": {...}},
+                    #        {"chunk": "..."}, {"done": true, "suggestion_id": N}
+                    _state = {"suggestion_id": None, "step1": None, "step2": None}
 
                     def _text_chunks():
                         for line in response.iter_lines():
@@ -237,20 +302,33 @@ if st.session_state["pending_llm_call"]:
                             data = json.loads(line)
                             if data.get("done"):
                                 _state["suggestion_id"] = data.get("suggestion_id")
-                            else:
-                                yield data.get("chunk", "")
+                            elif "step1" in data:
+                                _state["step1"] = data["step1"]
+                            elif "step2" in data:
+                                _state["step2"] = data["step2"]
+                            elif "brainstorm" in data:
+                                pass  # two_step metadata
+                            elif "chunk" in data:
+                                yield data["chunk"]
 
                     suggestion_text = st.write_stream(_text_chunks())
                     suggestion_id = _state["suggestion_id"]
+                    step1 = _state["step1"] or step1
+                    step2 = _state["step2"] or step2
             else:
                 st.error(f"Backend error: {response.text}")
         except Exception as e:
             st.error(f"Error connecting to backend: {e}")
 
     if suggestion_text and suggestion_text.strip():
-        st.session_state["suggestions"].append(
-            {"text": suggestion_text.strip(), "suggestion_id": suggestion_id}
-        )
+        st.session_state["suggestions"].append({
+            "text": suggestion_text.strip(),
+            "suggestion_id": suggestion_id,
+            "pipeline": pipeline,
+            "reply_model": reply_model,
+            "step1": step1,
+            "step2": step2,
+        })
 
     st.rerun()
 

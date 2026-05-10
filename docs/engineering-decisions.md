@@ -490,6 +490,164 @@ Streamlit text areas don't commit their value to session state until the widget 
 
 ---
 
+---
+
+## Session: 2026-05-06 — Multi-Step Pipeline, Training Strategy & Eval Redesign
+
+### Decision 22: SFT Quality Diagnosis — Why the Fine-Tuned Model Underperformed
+
+**The situation:** The first SFT run produced a model whose outputs felt "wonky" — it picked up surface patterns from the training data but didn't generalise well. Responses felt formulaic, sometimes mirroring specific phrases from training examples rather than reasoning from the conversation.
+
+**The diagnosis:** SFT trained end-to-end on (conversation → reply) pairs teaches the model to pattern-match on surface features. Given input X, output something that statistically looks like the training replies. It cannot learn *judgment* — when to probe vs respond, when to tease vs empathize, how to find a non-obvious angle — because the training signal provides no intermediate reasoning. The model sees the input and the output but never the thinking in between.
+
+A second problem: the training data had noise. Real conversations are idiosyncratic. The model learned some very specific stylistic tics from the training examples and generalised those tics incorrectly.
+
+**The conclusion:** SFT is good at teaching *delivery* (voice, register, length, phrasing) but not *direction* (what angle to take, what the person actually needs). These are different cognitive tasks. The architecture needs to separate them.
+
+---
+
+### Decision 23: 3-Step Pipeline Architecture — Analyse, Evaluate, Deliver
+
+**The situation:** The single-stage pipeline (conversation → LLM → reply) asks one model to simultaneously figure out what to do AND express it well. For a 1.5B parameter model, that's two distinct problems compressed into one pass.
+
+**The proposed architecture:**
+
+```
+Step 1 — Analyser + Generator (gpt-4o-mini)
+  Input:  conversation context
+  Task:   analyse emotion, energy, keywords → generate 3 candidate directions
+  Output: analysis block + [{angle, draft}, {angle, draft}, {angle, draft}]
+  Logged: visible for debugging — what directions were on the table?
+
+Step 2 — Evaluator/Selector (gpt-4o-mini)
+  Input:  conversation + 3 directions from Step 1
+  Task:   deliberate internally → select best → output a slightly refined direction
+  Internal reasoning: chain-of-thought (not passed forward)
+  Output: {angle, draft}  ← clean brief only
+  Logged: which direction won and what it looked like after refinement
+
+Step 3 — Refiner (fine-tuned Qwen 1.5B)
+  Input:  conversation + {angle, draft} from Step 2
+  Task:   express the direction as natural, human Chinese texting
+  Output: final reply
+  Logged: scored by the judge
+```
+
+**Why keep Step 2 separate from Step 1:** The main argument is *observability*. If analysis, generation, and selection all happen in one LLM call, you get one opaque output and cannot tell whether a bad final reply was caused by a bad direction being generated, the wrong direction being selected, or weak delivery. With three separate logged outputs, you know exactly where the pipeline broke.
+
+A secondary argument: Step 2 has "fresh eyes" — it wasn't anchored to any one direction while generating, so its selection is less biased than self-evaluation by the generating model.
+
+**Why Step 2's reasoning stays internal:** Step 3's job is delivery, not interpretation. If Step 2 passes a critique ("this direction is good but the tone is too formal"), Step 3 has to parse that criticism and decide what to do with it. That adds failure modes. Step 2 should do the interpretation itself and pass only a clean, confident brief to Step 3.
+
+**Why not separate the analysis step further (analyse → generate → evaluate):** Over-engineering. Analysing the conversation IS the prerequisite context for generating directions — they belong together. Separating them would add a fourth API call for no quality gain.
+
+**Trade-offs:**
+- 3 API calls per reply vs 1 (latency + cost) — marginal at gpt-4o-mini pricing
+- Steps 1+2 (cloud, reasoning) vs Step 3 (local fine-tuned Qwen, fast) — good cognitive division of labour
+- More moving parts to maintain — worth it for the debugging visibility
+
+---
+
+### Decision 24: Phase 1 Backtracking for Training Data Generation
+
+**The situation:** To fine-tune Step 3 (the refiner), we need (direction → reply) training pairs. We have 73 real conversations with real ground-truth replies. The naive approach would be to run Phase 1 forward (generate a direction from the conversation) and pair it with the real reply. Problem: the forward-generated direction might suggest a completely different angle than what the ground-truth reply actually takes. The training pair would be incoherent — Step 3 would be trained to produce reply Y given direction X, but X doesn't lead to Y.
+
+**The decision:** Backtracking. Instead of running Phase 1 forward, ask a "coach" LLM: *given this conversation AND this actual reply, what Phase 1 output (keywords, analysis, angle, draft) would most naturally have led to this reply?*
+
+This guarantees coherent (direction → reply) pairs because the direction is reverse-engineered to be logically consistent with the reply.
+
+**The prompt (`brainstorm_backtrack_v1.txt`):** Separate from the production forward prompt (`brainstorm_v1.txt`). The backtracking prompt has `{CONVERSATION}` and `{ACTUAL_REPLY}` placeholders; the production prompt has `{CONVERSATION}` and `{SUMMARY}` only (no peeking at the answer during inference).
+
+**Output format:** `{keywords: [{word, significance}], analysis, angle, draft}` — same schema as the production Phase 1 output so the training data directly mirrors the inference-time input to Step 3.
+
+**Implementation:** `training/prep_orpo_data.ipynb` — processes all 73 conversations, runs the backtracking LLM for every assistant turn (every turn is a teachable moment, not just the last), writes `output/augmented_phase1.csv`.
+
+**Trade-off:** The direction in training data reflects what the real reply did, not necessarily what a perfect Phase 1 would have chosen. This is intentional — the goal is to train Step 3, and Step 3 should learn to execute any coherent direction well, regardless of whether the direction was optimal.
+
+---
+
+### Decision 25: Emotional Intelligence Design Principles for Phase 1
+
+**The situation:** The brainstorm prompt was generating directions that were generically correct but emotionally shallow. Output like "she's frustrated, try to comfort her" was technically accurate but didn't capture the specific angle that makes a reply feel genuinely resonant.
+
+**The analysis:** What separates a response that makes someone feel *truly seen* from one that feels like generic comfort:
+
+1. **Specificity over generality** — a reply that could only be sent to this person in this conversation is worth more than any well-phrased generic response. The single most reliable proxy for emotional quality.
+
+2. **Emotional need vs emotional label** — reading "she's frustrated" is step 1. Knowing she needs *permission to vent* (not solutions, not silver linings) is step 2. The response should address the need, not acknowledge the label.
+
+3. **Lateral association** — the best angles come from following a keyword 2 steps past its obvious meaning. "苦" → bitter tea → "actually not that bitter, I've had it" addresses both the literal complaint and the emotional exhaustion simultaneously without ever naming either.
+
+4. **The counter-intuitive move** — sometimes the right response goes in the opposite direction of what's expected. Peer relationships handle frustration with bluntness and dark humour, not reassurance.
+
+5. **Zoom level as a deliberate choice** — zoom out (pattern recognition: "you always attract the difficult ones"), stay level (direct reaction), or zoom in (hyper-specific image: "you must have that frown right now"). Each creates a different kind of intimacy.
+
+**Resulting prompt design changes:**
+- Phase 1 now identifies keywords that carry double meaning (literal + subtext), not just surface emotional labels
+- Directions explicitly classified by which layer of the keyword they respond to
+- Rules added: no restating what just happened, no hollow empathy phrases, respond as a real person existing in the physical world (can offer to meet, buy food, etc.)
+- Hook requirement: every draft must end open, not with a closing statement
+
+---
+
+### Decision 26: Eval Framework Redesign — From 6 Overlapping Dimensions to 6 Clean Ones
+
+**The problem with the original rubric:**
+- `authenticity` and `ai_naturalness` measured the same thing from two angles — redundant
+- Nothing measured *specificity* — whether the reply was tailored to this specific conversation — the single most important quality signal
+- `emotional_match` only checked if the emotion was read correctly, not if the response addressed the right *need*
+- 1–5 scale is noisy with LLM judges; they cluster around 3–4 and inconsistent across runs
+- Hardcoded in `api/llm.py` — unversioned, uneditable without a code deploy
+
+**The new framework (`training/prompts/judge_v1.txt`):**
+
+| Dimension | Core question |
+|---|---|
+| `specificity` | Could this only be sent to this person in this conversation? |
+| `need_accuracy` | Did it respond to what they *need* right now, not just what they said? |
+| `peer_authenticity` | Real friend texting, or chatbot/therapist? (merges old authenticity + ai_naturalness) |
+| `respect` | No unsolicited advice, judgment, or silver linings? |
+| `engagement` | Does the ending leave something open? |
+| `originality` | Did it find an unexpected but accurate angle, or was it completely predictable? |
+
+**Scale change: 1–5 → 1–3.** Simpler anchors, more consistent scores. LLMs reliably distinguish "clearly fails / partially / executes well" better than a 5-point scale.
+
+**Justification quality requirement:** Every justification must cite specific content from the reply or conversation. Vague evaluations ("语气自然") are left blank. This forces the judge to be accountable and makes the output actually useful for debugging.
+
+**Architecture change:** Prompt moved to a versioned file (`training/prompts/judge_v1.txt`), loaded at startup via `settings.judge_prompt_file`. Updating the eval no longer requires a code change.
+
+---
+
+### Decision 27: SFT Then DPO on Step 3 — What Each Teaches
+
+**The question:** Does fine-tuning Step 3 (the refiner) actually help, given that it receives a clean direction brief from Step 2?
+
+**Concrete answer — what base Qwen 1.5B gets wrong:**
+
+Given a direction brief: `{angle: "顺着'苦'的字面义接话，轻巧帮她换选择", draft: "那喝杯别的？其实不苦，我喝过"}`
+
+Base Qwen produces:
+> "听起来你真的很苦呢，要不要换一杯别的饮料试试？这样可能会让你感觉好一点哦"
+
+The direction was correct. The delivery failed: narrated the emotion back, hedged with "可能" / "试试", added therapist language, used 3 sentences when 1 works.
+
+**What SFT specifically teaches:**
+1. *Confident assertion over hedging* — the training data has almost no hedged statements; the prior shifts
+2. *Length calibration* — you can write "keep it short" in a prompt forever; the model still pads. After SFT on 200+ examples where the correct reply is 1–2 lines, short becomes the default
+3. *Banned phrase suppression* — "加油", "我理解你的感受", "真的很棒" appear in gpt-4o-mini pretraining with positive associations. SFT actively suppresses them by never using them as correct outputs
+4. *The peer-tease pattern* — for good news, the correct response is playful tease, not congratulations. Base model pretraining strongly associates "good news → celebrate". SFT on your data reweights this
+
+**What DPO adds beyond SFT:**
+
+SFT averages the training examples. If the data has even slight variation in quality, the model regresses toward the mean. DPO explicitly pushes *away* from specific failure modes:
+
+- **The softened tease:** SFT model might produce `"是不是要请我吃饭嘿嘿"` (adds "嘿嘿" as a timid softener). DPO pair: chosen = blunt version, rejected = softened version. Teaches: don't hedge the tease.
+- **Weak hook:** SFT model ends correctly but weakly: `"你今天还好吗？"`. Chosen = specific callback hook. Rejected = generic exit question. Teaches: the hook must be specific to this conversation, not a generic "how are you."
+
+**Risk at 1.5B:** DPO can degrade small models if the preference signal is noisy or chosen/rejected pairs are too similar. Run SFT first, evaluate with the judge, then apply DPO only if there are consistent systematic failure modes worth explicitly penalising.
+
+---
+
 ## What's Next
 
 **Completed:**
